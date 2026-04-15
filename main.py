@@ -91,8 +91,8 @@ async def handle_media_stream(websocket: WebSocket):
     transcript = []
 
     async with websockets.connect(
-        "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01",
-        extra_headers={
+        "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17",
+        additional_headers={
             "Authorization": f"Bearer {OPENAI_API_KEY}",
             "OpenAI-Beta": "realtime=v1",
         },
@@ -145,6 +145,7 @@ async def handle_media_stream(websocket: WebSocket):
 
 
 async def initialize_voice_session(openai_ws):
+    print("🔗 Connected to OpenAI Realtime API")
     await openai_ws.send(json.dumps({
         "type": "session.update",
         "session": {
