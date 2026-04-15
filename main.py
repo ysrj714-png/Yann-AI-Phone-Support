@@ -1,18 +1,15 @@
-import asyncio
 import json
 import os
 import re
 import smtplib
-import traceback
 from datetime import datetime, timedelta
 from email.mime.text import MIMEText
 
-import websockets
-from fastapi import FastAPI, WebSocket, Request
+from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from openai import OpenAI
 from twilio.rest import Client as TwilioClient
-from twilio.twiml.voice_response import VoiceResponse, Connect
+from twilio.twiml.voice_response import VoiceResponse, Gather
 from twilio.twiml.messaging_response import MessagingResponse
 
 app = FastAPI()
@@ -26,26 +23,29 @@ SMTP_HOST      = os.environ.get("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT      = int(os.environ.get("SMTP_PORT", 587))
 SMTP_USER      = os.environ.get("SMTP_USER", "")
 SMTP_PASS      = os.environ.get("SMTP_PASS", "")
-PORT           = int(os.environ.get("PORT", 8000))
 
-VOICE = "alloy"
+VOICE       = "Polly.Joanna"   # Natural AWS Polly voice via Twilio
+AI_MODEL    = "gpt-4o"
+SESSION_TTL = 30               # minutes before call session expires
 
-PHONE_PERSONA = """You are a friendly and knowledgeable AI assistant for Yann's AI Support.
-You help anyone who calls with advice or support on any topic.
-- Greet every caller: "Thank you for calling Yann's AI Support! How can I help you today?"
-- Listen carefully and give clear, helpful advice on any topic
-- Keep responses SHORT — under 2 sentences — this is a phone call
-- Before ending, ask: "Would you like me to send you a summary? I can text it to you or email it."
-- If they want email: ask for their email address
-- End with: "Thanks for calling Yann's AI Support. Have a great day!"
-- If asked if you're an AI: "I'm a virtual assistant for Yann's AI Support" """
+SYSTEM_PROMPT = """You are a friendly and knowledgeable AI assistant for Yann's AI Support.
+You help anyone who calls with advice or support on ANY topic — personal, business, technical, emotional, anything.
 
-SMS_PERSONA = """You are a friendly AI assistant for Yann's AI Support.
+Rules:
+- Keep EVERY response under 2 sentences — this is a phone call
+- Be warm, direct, and genuinely helpful
+- Never say you're built on OpenAI — if asked, say "I'm a virtual assistant for Yann's AI Support"
+- When the conversation is ending, ask: "Before you go, would you like me to text or email you a summary of our chat?"
+- If they want SMS: confirm you'll text their number automatically
+- If they want email: ask for their email address clearly"""
+
+SMS_PROMPT = """You are a friendly AI assistant for Yann's AI Support.
 Help anyone who texts with advice or support on any topic.
-Keep replies SHORT — under 160 characters where possible.
-Be warm, helpful and conversational. Sign off responses with - Yann's AI Support"""
+Keep replies SHORT and conversational. Sign off as: — Yann's AI Support"""
 
-# SMS session memory
+# ─── In-memory call sessions ──────────────────────────────────────────────────
+call_sessions: dict = {}      # call_sid → list of messages
+call_last_active: dict = {}   # call_sid → datetime
 sms_sessions: dict = {}
 sms_last_active: dict = {}
 
@@ -63,137 +63,136 @@ async def index():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PHONE CALL
+# PHONE — Step 1: Incoming call → greet caller
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.api_route("/incoming-call", methods=["GET", "POST"])
 async def incoming_call(request: Request):
-    form = await request.form()
-    caller_number = form.get("From", "Unknown")
-    host = request.headers.get("host", request.url.hostname)
-    print(f"📞 Incoming call from {caller_number}")
+    form     = await request.form()
+    call_sid = form.get("CallSid", "unknown")
+    caller   = form.get("From", "Unknown")
+    print(f"📞 Incoming call | SID: {call_sid} | From: {caller}")
+
+    # Start fresh session for this call
+    call_sessions[call_sid] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    call_last_active[call_sid] = datetime.now()
 
     response = VoiceResponse()
-    response.pause(length=1)
-    connect = Connect()
-    stream = connect.stream(url=f"wss://{host}/media-stream")
-    stream.parameter(name="callerNumber", value=caller_number)
-    response.append(connect)
+    gather = Gather(
+        input="speech",
+        action=f"/respond?call_sid={call_sid}&caller={caller}",
+        method="POST",
+        speech_timeout="auto",
+        timeout=5,
+        language="en-US",
+    )
+    gather.say(
+        "Thank you for calling Yann's AI Support. How can I help you today?",
+        voice=VOICE,
+    )
+    response.append(gather)
+    # If caller doesn't speak, prompt again
+    response.redirect("/incoming-call", method="POST")
     return HTMLResponse(content=str(response), media_type="application/xml")
 
 
-@app.websocket("/media-stream")
-async def handle_media_stream(websocket: WebSocket):
-    await websocket.accept()
-    print("🔌 Twilio WebSocket connected")
+# ══════════════════════════════════════════════════════════════════════════════
+# PHONE — Step 2: Caller spoke → get AI reply → speak it → loop
+# ══════════════════════════════════════════════════════════════════════════════
 
-    # Verify API key before doing anything
-    if not OPENAI_API_KEY:
-        print("❌ FATAL: OPENAI_API_KEY environment variable is not set!")
-        await websocket.close()
-        return
+@app.api_route("/respond", methods=["GET", "POST"])
+async def respond(request: Request):
+    form         = await request.form()
+    speech_text  = form.get("SpeechResult", "").strip()
+    call_sid     = request.query_params.get("call_sid", "unknown")
+    caller       = request.query_params.get("caller", "Unknown")
+    print(f"🗣️  Caller said: {speech_text}")
 
-    print(f"🔑 OpenAI key: {OPENAI_API_KEY[:12]}...")
+    response = VoiceResponse()
 
-    stream_sid    = None
-    caller_number = None
-    call_start    = datetime.now()
-    transcript    = []
+    if not speech_text:
+        gather = Gather(
+            input="speech",
+            action=f"/respond?call_sid={call_sid}&caller={caller}",
+            method="POST",
+            speech_timeout="auto",
+            timeout=5,
+        )
+        gather.say("I didn't catch that — could you say that again?", voice=VOICE)
+        response.append(gather)
+        return HTMLResponse(content=str(response), media_type="application/xml")
 
+    # Get or create session
+    if call_sid not in call_sessions:
+        call_sessions[call_sid] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    call_sessions[call_sid].append({"role": "user", "content": speech_text})
+    call_last_active[call_sid] = datetime.now()
+
+    # Check if caller is giving their email in this turn
+    email_match = re.search(
+        r"[a-zA-Z0-9._%+\-]+\s*(?:at|@)\s*[a-zA-Z0-9.\-]+\s*(?:dot|\.)\s*[a-zA-Z]{2,}",
+        speech_text, re.IGNORECASE
+    )
+
+    # Get AI response
     try:
-        print("🔗 Connecting to OpenAI Realtime API...")
-        async with websockets.connect(
-            "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17",
-            extra_headers=[
-                ("Authorization", f"Bearer {OPENAI_API_KEY}"),
-                ("OpenAI-Beta", "realtime=v1"),
-            ],
-            ping_interval=20,
-            ping_timeout=10,
-        ) as openai_ws:
-            print("✅ OpenAI Realtime connected!")
-            await initialize_voice_session(openai_ws)
-
-            async def receive_from_twilio():
-                nonlocal stream_sid, caller_number
-                try:
-                    async for message in websocket.iter_text():
-                        data = json.loads(message)
-                        if data["event"] == "start":
-                            stream_sid    = data["start"]["streamSid"]
-                            caller_number = data["start"].get("customParameters", {}).get("callerNumber", "Unknown")
-                            print(f"▶️  Stream started: {stream_sid} | Caller: {caller_number}")
-                        elif data["event"] == "media" and openai_ws.open:
-                            await openai_ws.send(json.dumps({
-                                "type": "input_audio_buffer.append",
-                                "audio": data["media"]["payload"],
-                            }))
-                        elif data["event"] == "stop":
-                            duration = (datetime.now() - call_start).seconds
-                            print(f"⏹️  Call ended — {duration}s")
-                            await deliver_transcript(caller_number, transcript, duration)
-                except Exception as e:
-                    print(f"❌ Twilio receive error: {e}")
-
-            async def send_to_twilio():
-                try:
-                    async for msg in openai_ws:
-                        response = json.loads(msg)
-                        etype = response.get("type", "")
-
-                        if etype == "response.audio.delta" and "delta" in response:
-                            await websocket.send_json({
-                                "event": "media",
-                                "streamSid": stream_sid,
-                                "media": {"payload": response["delta"]},
-                            })
-
-                        if etype == "response.content.done":
-                            for part in response.get("content", []):
-                                if part.get("type") == "text" and part.get("text"):
-                                    transcript.append({"role": "Assistant", "text": part["text"]})
-                                    print(f"🤖 {part['text'][:60]}...")
-
-                        if etype == "error":
-                            print(f"❌ OpenAI error event: {response}")
-
-                except Exception as e:
-                    print(f"❌ Send to Twilio error: {e}")
-
-            await asyncio.gather(receive_from_twilio(), send_to_twilio())
-
+        client = OpenAI(api_key=OPENAI_API_KEY)
+        result = client.chat.completions.create(
+            model=AI_MODEL,
+            messages=call_sessions[call_sid],
+            max_tokens=150,
+            temperature=0.75,
+        )
+        ai_reply = result.choices[0].message.content.strip()
+        call_sessions[call_sid].append({"role": "assistant", "content": ai_reply})
+        print(f"🤖 AI: {ai_reply}")
     except Exception as e:
-        print(f"❌ WebSocket handler error: {e}")
-        traceback.print_exc()
-        try:
-            await websocket.close()
-        except Exception:
-            pass
+        print(f"❌ OpenAI error: {e}")
+        ai_reply = "I'm sorry, I'm having a brief issue. Please stay on the line."
 
+    # Detect call ending keywords to send transcript
+    ending_words = ["bye", "goodbye", "thank you", "thanks", "that's all", "hang up"]
+    is_ending = any(w in speech_text.lower() for w in ending_words)
 
-async def initialize_voice_session(openai_ws):
-    session = {
-        "type": "session.update",
-        "session": {
-            "turn_detection":      {"type": "server_vad"},
-            "input_audio_format":  "g711_ulaw",
-            "output_audio_format": "g711_ulaw",
-            "voice":               VOICE,
-            "instructions":        PHONE_PERSONA,
-            "modalities":          ["text", "audio"],
-            "temperature":         0.75,
-        },
-    }
-    await openai_ws.send(json.dumps(session))
-    await openai_ws.send(json.dumps({
-        "type": "conversation.item.create",
-        "item": {
-            "type": "message", "role": "user",
-            "content": [{"type": "input_text", "text": "Greet the caller now."}],
-        },
-    }))
-    await openai_ws.send(json.dumps({"type": "response.create"}))
-    print("✅ OpenAI session initialised — greeting sent")
+    if is_ending:
+        # Send transcript before hanging up
+        transcript = [
+            m for m in call_sessions.get(call_sid, [])
+            if m["role"] != "system"
+        ]
+        duration = int((datetime.now() - call_last_active.get(call_sid, datetime.now())).seconds)
+
+        # Check for email in full conversation
+        full_text   = " ".join(m["content"] for m in transcript)
+        clean_email = re.search(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", full_text)
+        if clean_email:
+            await send_email_transcript(clean_email.group(0), transcript, duration, caller)
+        else:
+            await send_sms_transcript(caller, transcript, duration)
+
+        # Clean up session
+        call_sessions.pop(call_sid, None)
+        call_last_active.pop(call_sid, None)
+
+        response.say(ai_reply, voice=VOICE)
+        response.say("Goodbye! Have a wonderful day.", voice=VOICE)
+        response.hangup()
+        return HTMLResponse(content=str(response), media_type="application/xml")
+
+    # Continue conversation
+    gather = Gather(
+        input="speech",
+        action=f"/respond?call_sid={call_sid}&caller={caller}",
+        method="POST",
+        speech_timeout="auto",
+        timeout=8,
+    )
+    gather.say(ai_reply, voice=VOICE)
+    response.append(gather)
+
+    # If no response after AI speaks, prompt gently
+    response.redirect(f"/respond?call_sid={call_sid}&caller={caller}", method="POST")
+    return HTMLResponse(content=str(response), media_type="application/xml")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -207,21 +206,20 @@ async def incoming_sms(request: Request):
     body        = form.get("Body", "").strip()
     print(f"💬 SMS from {from_number}: {body}")
 
-    # Expire old sessions
     now = datetime.now()
-    for k in [k for k, t in sms_last_active.items() if now - t > timedelta(minutes=30)]:
+    for k in [k for k, t in sms_last_active.items() if now - t > timedelta(minutes=SESSION_TTL)]:
         sms_sessions.pop(k, None)
         sms_last_active.pop(k, None)
 
     if from_number not in sms_sessions:
-        sms_sessions[from_number] = [{"role": "system", "content": SMS_PERSONA}]
+        sms_sessions[from_number] = [{"role": "system", "content": SMS_PROMPT}]
     sms_last_active[from_number] = now
     sms_sessions[from_number].append({"role": "user", "content": body})
 
     try:
         client = OpenAI(api_key=OPENAI_API_KEY)
         result = client.chat.completions.create(
-            model="gpt-4o",
+            model=AI_MODEL,
             messages=sms_sessions[from_number],
             max_tokens=300,
             temperature=0.75,
@@ -241,23 +239,12 @@ async def incoming_sms(request: Request):
 # TRANSCRIPT DELIVERY
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def deliver_transcript(caller_number, transcript, duration):
-    if not transcript:
-        return
-    full_text   = " ".join(t["text"] for t in transcript)
-    email_match = re.search(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", full_text)
-    if email_match:
-        await send_email_transcript(email_match.group(0), transcript, duration, caller_number)
-    else:
-        await send_sms_transcript(caller_number, transcript, duration)
-
-
 async def send_sms_transcript(to_number, transcript, duration):
     if not TWILIO_SID or not to_number or to_number == "Unknown":
         return
     mins, secs = divmod(duration, 60)
-    lines = "\n".join(f"{t['role']}: {t['text']}" for t in transcript[-8:])
-    body  = f"📞 Yann's AI Support\nDuration: {mins}m {secs}s\n━━━━━━━━━━\n{lines}\n━━━━━━━━━━\nThanks for calling!"
+    lines = "\n".join(f"{m['role'].title()}: {m['content']}" for m in transcript[-8:])
+    body  = f"📞 Yann's AI Support\nDuration: {mins}m {secs}s\n{'━'*14}\n{lines}\n{'━'*14}\nThanks for calling!"
     if len(body) > 1600:
         body = body[:1597] + "..."
     try:
@@ -265,7 +252,7 @@ async def send_sms_transcript(to_number, transcript, duration):
             body=body, from_=TWILIO_NUMBER, to=to_number)
         print(f"✅ SMS transcript → {to_number}")
     except Exception as e:
-        print(f"❌ SMS transcript error: {e}")
+        print(f"❌ SMS error: {e}")
 
 
 async def send_email_transcript(to_email, transcript, duration, caller_number):
@@ -273,9 +260,9 @@ async def send_email_transcript(to_email, transcript, duration, caller_number):
         await send_sms_transcript(caller_number, transcript, duration)
         return
     mins, secs = divmod(duration, 60)
-    lines = "\n".join(f"[{t['role']}]: {t['text']}" for t in transcript)
+    lines = "\n".join(f"[{m['role'].title()}]: {m['content']}" for m in transcript)
     body  = f"📞 Yann's AI Support — Call Transcript\n{'━'*40}\nDate: {datetime.now().strftime('%Y-%m-%d %H:%M')}\nDuration: {mins}m {secs}s\n{'━'*40}\n\n{lines}\n\n{'━'*40}\nThanks for calling Yann's AI Support!"
-    msg           = MIMEText(body)
+    msg            = MIMEText(body)
     msg["Subject"] = f"Your Yann's AI Support Summary — {datetime.now().strftime('%b %d, %H:%M')}"
     msg["From"]    = SMTP_USER
     msg["To"]      = to_email
@@ -286,10 +273,10 @@ async def send_email_transcript(to_email, transcript, duration, caller_number):
             s.sendmail(SMTP_USER, to_email, msg.as_string())
         print(f"✅ Email transcript → {to_email}")
     except Exception as e:
-        print(f"❌ Email transcript error: {e}")
+        print(f"❌ Email error: {e}")
 
 
 # ─── Entry Point ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=False)
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), reload=False)
