@@ -3,3 +3,4 @@ uvicorn[standard]==0.32.1
 websockets==13.1
 twilio==9.3.7
 python-dotenv==1.0.1
+openai==1.54.0
