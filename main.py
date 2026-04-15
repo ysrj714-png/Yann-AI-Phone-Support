@@ -6,6 +6,7 @@ from email.mime.text import MIMEText
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse
+import httpx
 from openai import OpenAI
 from twilio.rest import Client as TwilioClient
 from twilio.twiml.voice_response import VoiceResponse, Gather
@@ -302,7 +303,7 @@ async def incoming_sms(request: Request):
     sms_sessions[from_number].append({"role": "user", "content": body})
 
     try:
-        client = OpenAI(api_key=OPENAI_API_KEY)
+        client = OpenAI(api_key=OPENAI_API_KEY, http_client=httpx.Client(trust_env=False))
         result = client.chat.completions.create(
             model=AI_MODEL,
             messages=sms_sessions[from_number],
