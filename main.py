@@ -1,4 +1,3 @@
-import json
 import os
 import re
 import smtplib
@@ -24,9 +23,8 @@ SMTP_PORT      = int(os.environ.get("SMTP_PORT", 587))
 SMTP_USER      = os.environ.get("SMTP_USER", "")
 SMTP_PASS      = os.environ.get("SMTP_PASS", "")
 
-VOICE       = "Polly.Joanna"   # Natural AWS Polly voice via Twilio
-AI_MODEL    = "gpt-4o"
-SESSION_TTL = 30               # minutes before call session expires
+VOICE      = "Polly.Joanna"
+AI_MODEL   = "gpt-4o"
 
 SYSTEM_PROMPT = """You are a friendly and knowledgeable AI assistant for Yann's AI Support.
 You help anyone who calls with advice or support on ANY topic — personal, business, technical, emotional, anything.
@@ -34,36 +32,41 @@ You help anyone who calls with advice or support on ANY topic — personal, busi
 Rules:
 - Keep EVERY response under 2 sentences — this is a phone call
 - Be warm, direct, and genuinely helpful
-- Never say you're built on OpenAI — if asked, say "I'm a virtual assistant for Yann's AI Support"
-- When the conversation is ending, ask: "Before you go, would you like me to text or email you a summary of our chat?"
-- If they want SMS: confirm you'll text their number automatically
-- If they want email: ask for their email address clearly"""
+- Never reveal you're built on OpenAI. If asked say: "I'm a virtual assistant for Yann's AI Support"
+- When the caller's question has been answered or they seem done, say:
+  "Before you go — would you like me to send you a summary of our chat? Just say text, email, or both."
+- If they say EMAIL or BOTH: ask "What's your email address?" and wait for it
+- If they say TEXT: say "Got it, I'll text a summary to your number. Thanks for calling Yann's AI Support, goodbye!"
+- After collecting the email say: "Perfect, I'll send that over now. Thanks for calling Yann's AI Support, goodbye!" """
 
 SMS_PROMPT = """You are a friendly AI assistant for Yann's AI Support.
 Help anyone who texts with advice or support on any topic.
-Keep replies SHORT and conversational. Sign off as: — Yann's AI Support"""
+Keep replies SHORT and conversational. End with: — Yann's AI Support"""
 
-# ─── In-memory call sessions ──────────────────────────────────────────────────
-call_sessions: dict = {}      # call_sid → list of messages
-call_last_active: dict = {}   # call_sid → datetime
-sms_sessions: dict = {}
+# ─── Session storage ──────────────────────────────────────────────────────────
+# Each call_sid maps to a dict:
+# { "messages": [...], "stage": "chat"|"asking_delivery"|"asking_email"|"done",
+#   "delivery": None|"text"|"email"|"both", "email": None|"user@example.com" }
+call_sessions: dict = {}
+sms_sessions:  dict = {}
 sms_last_active: dict = {}
+
+ENDING_WORDS = ["goodbye", "bye", "hang up", "that's all", "that is all", "thank you", "thanks"]
 
 
 # ─── Health Check ─────────────────────────────────────────────────────────────
 @app.get("/")
 async def index():
-    key_status = f"set ({OPENAI_API_KEY[:8]}...)" if OPENAI_API_KEY else "MISSING ❌"
     return {
         "status": "ok",
         "service": "Yann's AI Support",
-        "openai_key": key_status,
+        "openai_key": f"set ({OPENAI_API_KEY[:8]}...)" if OPENAI_API_KEY else "MISSING ❌",
         "twilio_sid": "set" if TWILIO_SID else "MISSING ❌",
     }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PHONE — Step 1: Incoming call → greet caller
+# PHONE — Incoming call
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.api_route("/incoming-call", methods=["GET", "POST"])
@@ -71,14 +74,18 @@ async def incoming_call(request: Request):
     form     = await request.form()
     call_sid = form.get("CallSid", "unknown")
     caller   = form.get("From", "Unknown")
-    print(f"📞 Incoming call | SID: {call_sid} | From: {caller}")
+    print(f"📞 Call from {caller} | SID: {call_sid}")
 
-    # Start fresh session for this call
-    call_sessions[call_sid] = [{"role": "system", "content": SYSTEM_PROMPT}]
-    call_last_active[call_sid] = datetime.now()
+    call_sessions[call_sid] = {
+        "messages":  [{"role": "system", "content": SYSTEM_PROMPT}],
+        "stage":     "chat",
+        "delivery":  None,
+        "email":     None,
+        "start":     datetime.now(),
+    }
 
     response = VoiceResponse()
-    gather = Gather(
+    gather   = Gather(
         input="speech",
         action=f"/respond?call_sid={call_sid}&caller={caller}",
         method="POST",
@@ -86,31 +93,28 @@ async def incoming_call(request: Request):
         timeout=5,
         language="en-US",
     )
-    gather.say(
-        "Thank you for calling Yann's AI Support. How can I help you today?",
-        voice=VOICE,
-    )
+    gather.say("Thank you for calling Yann's AI Support. How can I help you today?", voice=VOICE)
     response.append(gather)
-    # If caller doesn't speak, prompt again
     response.redirect("/incoming-call", method="POST")
     return HTMLResponse(content=str(response), media_type="application/xml")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PHONE — Step 2: Caller spoke → get AI reply → speak it → loop
+# PHONE — Caller responds
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.api_route("/respond", methods=["GET", "POST"])
 async def respond(request: Request):
-    form         = await request.form()
-    speech_text  = form.get("SpeechResult", "").strip()
-    call_sid     = request.query_params.get("call_sid", "unknown")
-    caller       = request.query_params.get("caller", "Unknown")
-    print(f"🗣️  Caller said: {speech_text}")
+    form        = await request.form()
+    speech      = form.get("SpeechResult", "").strip()
+    call_sid    = request.query_params.get("call_sid", "unknown")
+    caller      = request.query_params.get("caller", "Unknown")
+    print(f"🗣️  [{call_sid[:8]}] Caller said: {speech}")
 
     response = VoiceResponse()
 
-    if not speech_text:
+    # Nothing heard — re-prompt
+    if not speech:
         gather = Gather(
             input="speech",
             action=f"/respond?call_sid={call_sid}&caller={caller}",
@@ -118,68 +122,133 @@ async def respond(request: Request):
             speech_timeout="auto",
             timeout=5,
         )
-        gather.say("I didn't catch that — could you say that again?", voice=VOICE)
+        gather.say("Sorry, I didn't catch that. Could you say that again?", voice=VOICE)
         response.append(gather)
         return HTMLResponse(content=str(response), media_type="application/xml")
 
-    # Get or create session
-    if call_sid not in call_sessions:
-        call_sessions[call_sid] = [{"role": "system", "content": SYSTEM_PROMPT}]
-    call_sessions[call_sid].append({"role": "user", "content": speech_text})
-    call_last_active[call_sid] = datetime.now()
+    session = call_sessions.get(call_sid, {
+        "messages": [{"role": "system", "content": SYSTEM_PROMPT}],
+        "stage": "chat", "delivery": None, "email": None, "start": datetime.now(),
+    })
+    call_sessions[call_sid] = session
+    stage = session["stage"]
 
-    # Check if caller is giving their email in this turn
-    email_match = re.search(
-        r"[a-zA-Z0-9._%+\-]+\s*(?:at|@)\s*[a-zA-Z0-9.\-]+\s*(?:dot|\.)\s*[a-zA-Z]{2,}",
-        speech_text, re.IGNORECASE
-    )
+    # ── Stage: waiting for email address ──────────────────────────────────────
+    if stage == "asking_email":
+        email = extract_email(speech)
+        if email:
+            session["email"] = email
+            session["stage"] = "done"
+            print(f"📧 Email captured: {email}")
+            ai_reply = f"Perfect! I'll send the summary to {email} right away. Thanks for calling Yann's AI Support, goodbye!"
+            await end_call(session, caller, ai_reply)
+            response.say(ai_reply, voice=VOICE)
+            response.hangup()
+        else:
+            response.say(
+                "I didn't quite catch that. Could you spell out your email address?",
+                voice=VOICE,
+            )
+            gather = Gather(
+                input="speech",
+                action=f"/respond?call_sid={call_sid}&caller={caller}",
+                method="POST",
+                speech_timeout="auto",
+                timeout=8,
+            )
+            response.append(gather)
+        return HTMLResponse(content=str(response), media_type="application/xml")
 
-    # Get AI response
+    # ── Stage: waiting for delivery preference (text/email/both) ─────────────
+    if stage == "asking_delivery":
+        lower = speech.lower()
+        if "both" in lower:
+            session["delivery"] = "both"
+            session["stage"]    = "asking_email"
+            response.say("Great! And what's your email address?", voice=VOICE)
+            gather = Gather(
+                input="speech",
+                action=f"/respond?call_sid={call_sid}&caller={caller}",
+                method="POST",
+                speech_timeout="auto",
+                timeout=8,
+            )
+            response.append(gather)
+        elif "email" in lower:
+            session["delivery"] = "email"
+            session["stage"]    = "asking_email"
+            response.say("Of course! What's your email address?", voice=VOICE)
+            gather = Gather(
+                input="speech",
+                action=f"/respond?call_sid={call_sid}&caller={caller}",
+                method="POST",
+                speech_timeout="auto",
+                timeout=8,
+            )
+            response.append(gather)
+        elif "text" in lower or "sms" in lower:
+            session["delivery"] = "text"
+            session["stage"]    = "done"
+            ai_reply = "Perfect! I'll text a summary to your number now. Thanks for calling Yann's AI Support, have a great day!"
+            await end_call(session, caller, ai_reply)
+            response.say(ai_reply, voice=VOICE)
+            response.hangup()
+        else:
+            # Couldn't detect preference — ask again
+            gather = Gather(
+                input="speech",
+                action=f"/respond?call_sid={call_sid}&caller={caller}",
+                method="POST",
+                speech_timeout="auto",
+                timeout=5,
+            )
+            gather.say("Sorry — please say text, email, or both.", voice=VOICE)
+            response.append(gather)
+        return HTMLResponse(content=str(response), media_type="application/xml")
+
+    # ── Stage: normal chat ────────────────────────────────────────────────────
+    session["messages"].append({"role": "user", "content": speech})
+
+    # Check for ending words
+    is_ending = any(w in speech.lower() for w in ENDING_WORDS)
+
     try:
-        client = OpenAI(api_key=OPENAI_API_KEY)
-        result = client.chat.completions.create(
+        client   = OpenAI(api_key=OPENAI_API_KEY)
+        result   = client.chat.completions.create(
             model=AI_MODEL,
-            messages=call_sessions[call_sid],
-            max_tokens=150,
+            messages=session["messages"],
+            max_tokens=120,
             temperature=0.75,
         )
         ai_reply = result.choices[0].message.content.strip()
-        call_sessions[call_sid].append({"role": "assistant", "content": ai_reply})
+        session["messages"].append({"role": "assistant", "content": ai_reply})
         print(f"🤖 AI: {ai_reply}")
     except Exception as e:
         print(f"❌ OpenAI error: {e}")
-        ai_reply = "I'm sorry, I'm having a brief issue. Please stay on the line."
+        ai_reply = "I'm sorry, I had a brief issue. Could you repeat that?"
 
-    # Detect call ending keywords to send transcript
-    ending_words = ["bye", "goodbye", "thank you", "thanks", "that's all", "hang up"]
-    is_ending = any(w in speech_text.lower() for w in ending_words)
-
-    if is_ending:
-        # Send transcript before hanging up
-        transcript = [
-            m for m in call_sessions.get(call_sid, [])
-            if m["role"] != "system"
-        ]
-        duration = int((datetime.now() - call_last_active.get(call_sid, datetime.now())).seconds)
-
-        # Check for email in full conversation
-        full_text   = " ".join(m["content"] for m in transcript)
-        clean_email = re.search(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", full_text)
-        if clean_email:
-            await send_email_transcript(clean_email.group(0), transcript, duration, caller)
+    # If AI naturally asked about text/email/both, switch to asking_delivery stage
+    delivery_cue = any(w in ai_reply.lower() for w in ["text, email, or both", "text or email", "send you a summary"])
+    if delivery_cue or is_ending:
+        session["stage"] = "asking_delivery"
+        gather = Gather(
+            input="speech",
+            action=f"/respond?call_sid={call_sid}&caller={caller}",
+            method="POST",
+            speech_timeout="auto",
+            timeout=8,
+        )
+        if delivery_cue:
+            gather.say(ai_reply, voice=VOICE)
         else:
-            await send_sms_transcript(caller, transcript, duration)
-
-        # Clean up session
-        call_sessions.pop(call_sid, None)
-        call_last_active.pop(call_sid, None)
-
-        response.say(ai_reply, voice=VOICE)
-        response.say("Goodbye! Have a wonderful day.", voice=VOICE)
-        response.hangup()
+            gather.say(
+                f"{ai_reply} Before you go — would you like a summary of our chat? Just say text, email, or both.",
+                voice=VOICE,
+            )
+        response.append(gather)
         return HTMLResponse(content=str(response), media_type="application/xml")
 
-    # Continue conversation
+    # Continue normal conversation
     gather = Gather(
         input="speech",
         action=f"/respond?call_sid={call_sid}&caller={caller}",
@@ -189,10 +258,26 @@ async def respond(request: Request):
     )
     gather.say(ai_reply, voice=VOICE)
     response.append(gather)
-
-    # If no response after AI speaks, prompt gently
     response.redirect(f"/respond?call_sid={call_sid}&caller={caller}", method="POST")
     return HTMLResponse(content=str(response), media_type="application/xml")
+
+
+async def end_call(session: dict, caller: str, ai_reply: str):
+    transcript = [m for m in session["messages"] if m["role"] != "system"]
+    duration   = int((datetime.now() - session.get("start", datetime.now())).seconds)
+    delivery   = session.get("delivery")
+    email      = session.get("email")
+
+    print(f"📋 Ending call | delivery={delivery} | email={email} | caller={caller}")
+
+    if delivery == "text":
+        await send_sms(caller, transcript, duration)
+    elif delivery == "email" and email:
+        await send_email(email, transcript, duration)
+    elif delivery == "both":
+        if email:
+            await send_email(email, transcript, duration)
+        await send_sms(caller, transcript, duration)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -207,7 +292,7 @@ async def incoming_sms(request: Request):
     print(f"💬 SMS from {from_number}: {body}")
 
     now = datetime.now()
-    for k in [k for k, t in sms_last_active.items() if now - t > timedelta(minutes=SESSION_TTL)]:
+    for k in [k for k, t in sms_last_active.items() if now - t > timedelta(minutes=30)]:
         sms_sessions.pop(k, None)
         sms_last_active.pop(k, None)
 
@@ -236,10 +321,22 @@ async def incoming_sms(request: Request):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TRANSCRIPT DELIVERY
+# HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def send_sms_transcript(to_number, transcript, duration):
+def extract_email(text: str) -> str | None:
+    """Extract email — handles spoken versions like 'john at gmail dot com'"""
+    # Normalise spoken email
+    normalised = text.lower()
+    normalised = re.sub(r"\s+at\s+", "@", normalised)
+    normalised = re.sub(r"\s+dot\s+", ".", normalised)
+    normalised = re.sub(r"\s+", "", normalised)
+
+    match = re.search(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", normalised)
+    return match.group(0) if match else None
+
+
+async def send_sms(to_number: str, transcript: list, duration: int):
     if not TWILIO_SID or not to_number or to_number == "Unknown":
         return
     mins, secs = divmod(duration, 60)
@@ -250,18 +347,23 @@ async def send_sms_transcript(to_number, transcript, duration):
     try:
         TwilioClient(TWILIO_SID, TWILIO_TOKEN).messages.create(
             body=body, from_=TWILIO_NUMBER, to=to_number)
-        print(f"✅ SMS transcript → {to_number}")
+        print(f"✅ SMS sent → {to_number}")
     except Exception as e:
         print(f"❌ SMS error: {e}")
 
 
-async def send_email_transcript(to_email, transcript, duration, caller_number):
+async def send_email(to_email: str, transcript: list, duration: int):
     if not SMTP_USER or not SMTP_PASS:
-        await send_sms_transcript(caller_number, transcript, duration)
+        print("⚠️  SMTP not configured — skipping email")
         return
     mins, secs = divmod(duration, 60)
-    lines = "\n".join(f"[{m['role'].title()}]: {m['content']}" for m in transcript)
-    body  = f"📞 Yann's AI Support — Call Transcript\n{'━'*40}\nDate: {datetime.now().strftime('%Y-%m-%d %H:%M')}\nDuration: {mins}m {secs}s\n{'━'*40}\n\n{lines}\n\n{'━'*40}\nThanks for calling Yann's AI Support!"
+    lines      = "\n".join(f"[{m['role'].title()}]: {m['content']}" for m in transcript)
+    body       = (
+        f"📞 Yann's AI Support — Call Summary\n{'━'*40}\n"
+        f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+        f"Duration: {mins}m {secs}s\n{'━'*40}\n\n{lines}\n\n{'━'*40}\n"
+        f"Thanks for calling Yann's AI Support!"
+    )
     msg            = MIMEText(body)
     msg["Subject"] = f"Your Yann's AI Support Summary — {datetime.now().strftime('%b %d, %H:%M')}"
     msg["From"]    = SMTP_USER
@@ -271,7 +373,7 @@ async def send_email_transcript(to_email, transcript, duration, caller_number):
             s.starttls()
             s.login(SMTP_USER, SMTP_PASS)
             s.sendmail(SMTP_USER, to_email, msg.as_string())
-        print(f"✅ Email transcript → {to_email}")
+        print(f"✅ Email sent → {to_email}")
     except Exception as e:
         print(f"❌ Email error: {e}")
 
