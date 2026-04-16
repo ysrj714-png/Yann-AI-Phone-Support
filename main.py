@@ -2,6 +2,7 @@ import asyncio
 import email as email_lib
 import email.utils as email_utils
 import imaplib
+import json
 import os
 import re
 import requests
@@ -33,6 +34,8 @@ IMAP_HOST      = os.environ.get("IMAP_HOST", "imap.gmail.com")
 IMAP_PORT      = int(os.environ.get("IMAP_PORT", 993))
 # How often (seconds) to check inbox for new replies
 EMAIL_POLL_INTERVAL = int(os.environ.get("EMAIL_POLL_INTERVAL", 30))
+# Where to persist sent Message-IDs so they survive server restarts
+SENT_IDS_FILE = os.environ.get("SENT_IDS_FILE", "sent_message_ids.json")
 
 VOICE = "Polly.Joanna"
 
@@ -60,9 +63,35 @@ email_processed: set = set()
 # Message-IDs of emails the bot has sent — we ONLY reply to emails whose
 # In-Reply-To matches one of these. This stops the bot from replying to
 # marketing emails, newsletters, or anything else in the inbox.
+# PERSISTED to disk so server restarts don't lose track of past sent emails.
 sent_message_ids: set  = set()
 # Set to True after the first poll drains the backlog without replying
 email_startup_done: bool = False
+
+
+def _load_sent_ids():
+    """Load sent Message-IDs from disk into memory on startup."""
+    global sent_message_ids
+    try:
+        if os.path.exists(SENT_IDS_FILE):
+            with open(SENT_IDS_FILE, "r") as f:
+                ids = json.load(f)
+            sent_message_ids.update(ids)
+            print(f"📂 Loaded {len(ids)} sent Message-ID(s) from {SENT_IDS_FILE}")
+        else:
+            print(f"📂 No sent-IDs file yet ({SENT_IDS_FILE}) — will create on first send")
+    except Exception as e:
+        print(f"⚠️  Could not load sent IDs: {e}")
+
+
+def _persist_sent_id(msg_id: str):
+    """Add a Message-ID to the in-memory set AND write it to disk."""
+    sent_message_ids.add(msg_id)
+    try:
+        with open(SENT_IDS_FILE, "w") as f:
+            json.dump(list(sent_message_ids), f)
+    except Exception as e:
+        print(f"⚠️  Could not persist sent ID: {e}")
 
 # ─── Pending email collection (from phone call) ───────────────────────────────
 pending_email: dict = {}     # call_sid → {"caller": "+1...", "stage": "collecting"}
@@ -83,6 +112,9 @@ async def index():
 # ─── Startup: launch email inbox poller ───────────────────────────────────────
 @app.on_event("startup")
 async def startup_event():
+    # Reload sent Message-IDs from disk FIRST so the poller can
+    # recognise replies to emails sent before this server restart.
+    _load_sent_ids()
     if SMTP_USER and SMTP_PASS:
         asyncio.create_task(email_inbox_poller())
         print(f"📬 Email inbox poller started (every {EMAIL_POLL_INTERVAL}s) for {SMTP_USER}")
@@ -385,8 +417,9 @@ def _send_email_reply(
         s.login(SMTP_USER, SMTP_PASS)
         s.sendmail(SMTP_USER, to_email, msg.as_string())
 
-    # Track this Message-ID so replies to it are recognised as conversations
-    sent_message_ids.add(new_mid)
+    # Track this Message-ID so replies to it are recognised — persisted to disk
+    # so the mapping survives server restarts.
+    _persist_sent_id(new_mid)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -616,9 +649,9 @@ async def send_opening_email(to_email: str):
     try:
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, _smtp_send_raw, to_email, msg)
-        # Track so the poller accepts replies from this person
-        sent_message_ids.add(new_mid)
-        print(f"✅ Opening email → {to_email} (Message-ID: {new_mid})")
+        # Track so the poller accepts replies from this person — persisted to disk
+    _persist_sent_id(new_mid)
+    print(f"✅ Opening email → {to_email} (Message-ID: {new_mid})")
     except Exception as e:
         print(f"❌ Opening email error: {e}")
 
