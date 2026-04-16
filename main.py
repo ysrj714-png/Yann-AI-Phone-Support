@@ -650,8 +650,8 @@ async def send_opening_email(to_email: str):
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, _smtp_send_raw, to_email, msg)
         # Track so the poller accepts replies from this person — persisted to disk
-    _persist_sent_id(new_mid)
-    print(f"✅ Opening email → {to_email} (Message-ID: {new_mid})")
+        _persist_sent_id(new_mid)
+        print(f"✅ Opening email → {to_email} (Message-ID: {new_mid})")
     except Exception as e:
         print(f"❌ Opening email error: {e}")
 
