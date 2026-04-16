@@ -1,9 +1,12 @@
 import asyncio
+import email as email_lib
+import imaplib
 import os
 import re
 import requests
 import smtplib
 from datetime import datetime, timedelta
+from email.header import decode_header as _decode_header
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from urllib.parse import quote, unquote
@@ -25,6 +28,10 @@ SMTP_HOST      = os.environ.get("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT      = int(os.environ.get("SMTP_PORT", 587))
 SMTP_USER      = os.environ.get("SMTP_USER", "")
 SMTP_PASS      = os.environ.get("SMTP_PASS", "")
+IMAP_HOST      = os.environ.get("IMAP_HOST", "imap.gmail.com")
+IMAP_PORT      = int(os.environ.get("IMAP_PORT", 993))
+# How often (seconds) to check inbox for new replies
+EMAIL_POLL_INTERVAL = int(os.environ.get("EMAIL_POLL_INTERVAL", 30))
 
 VOICE = "Polly.Joanna"
 
@@ -40,11 +47,18 @@ Sign every reply with:
 Best regards,
 Yann's AI Support"""
 
-# ─── Session memory ───────────────────────────────────────────────────────────
+# ─── SMS session memory ───────────────────────────────────────────────────────
 sms_sessions:    dict = {}   # phone_number → [messages]
 sms_last_active: dict = {}   # phone_number → datetime
 
-# ─── Pending email collection ─────────────────────────────────────────────────
+# ─── Email session memory ─────────────────────────────────────────────────────
+email_sessions:    dict = {}  # sender_email → [messages]
+email_last_active: dict = {}  # sender_email → datetime
+# Tracks Gmail UIDs already replied to (avoids double-replies on restart gaps).
+# Stored as a set of IMAP UID strings.
+email_processed: set = set()
+
+# ─── Pending email collection (from phone call) ───────────────────────────────
 pending_email: dict = {}     # call_sid → {"caller": "+1...", "stage": "collecting"}
 
 
@@ -56,7 +70,232 @@ async def index():
         "service":    "Yann's AI Support",
         "openai_key": f"set ({OPENAI_API_KEY[:8]}...)" if OPENAI_API_KEY else "MISSING ❌",
         "twilio":     "set" if TWILIO_SID else "MISSING ❌",
+        "smtp":       "set" if SMTP_USER else "MISSING ❌",
     }
+
+
+# ─── Startup: launch email inbox poller ───────────────────────────────────────
+@app.on_event("startup")
+async def startup_event():
+    if SMTP_USER and SMTP_PASS:
+        asyncio.create_task(email_inbox_poller())
+        print(f"📬 Email inbox poller started (every {EMAIL_POLL_INTERVAL}s) for {SMTP_USER}")
+    else:
+        print("⚠️  SMTP_USER/SMTP_PASS not set — email reply polling disabled")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EMAIL INBOX POLLER — checks Gmail via IMAP and replies with AI
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def email_inbox_poller():
+    """Async loop: poll Gmail inbox every EMAIL_POLL_INTERVAL seconds."""
+    # Wait a moment for server to finish starting up
+    await asyncio.sleep(5)
+    while True:
+        try:
+            loop = asyncio.get_event_loop()
+            # Run the blocking IMAP calls in a thread so the event loop isn't blocked
+            await loop.run_in_executor(None, _check_and_reply_inbox)
+        except Exception as e:
+            print(f"❌ Email poller error: {e}")
+        await asyncio.sleep(EMAIL_POLL_INTERVAL)
+
+
+def _check_and_reply_inbox():
+    """
+    Synchronous: connect to Gmail via IMAP, find UNSEEN emails,
+    generate AI replies, send them, and mark originals as read.
+    """
+    try:
+        mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
+        mail.login(SMTP_USER, SMTP_PASS)
+        mail.select("INBOX")
+
+        # Fetch all UNSEEN email UIDs
+        _, data = mail.uid("search", None, "UNSEEN")
+        uids = data[0].split() if data[0] else []
+
+        for uid in uids:
+            uid_str = uid.decode()
+
+            # Skip if we already processed this UID in a previous poll
+            if uid_str in email_processed:
+                mail.uid("store", uid, "+FLAGS", "\\Seen")
+                continue
+
+            # Fetch the full RFC822 message
+            _, msg_data = mail.uid("fetch", uid, "(RFC822)")
+            if not msg_data or not msg_data[0]:
+                continue
+            raw = msg_data[0][1]
+            msg = email_lib.message_from_bytes(raw)
+
+            # ── Parse sender ──────────────────────────────────────────────────
+            from_raw    = msg.get("From", "")
+            sender_addr = _parse_addr(from_raw)
+            if not sender_addr:
+                print(f"⚠️  Could not parse sender from: {from_raw!r} — skipping")
+                mail.uid("store", uid, "+FLAGS", "\\Seen")
+                continue
+
+            # Don't reply to our own sent emails (avoids infinite loops)
+            if sender_addr.lower() == SMTP_USER.lower():
+                mail.uid("store", uid, "+FLAGS", "\\Seen")
+                email_processed.add(uid_str)
+                continue
+
+            # ── Parse subject ────────────────────────────────────────────────
+            subject_raw = msg.get("Subject", "No Subject")
+            subject     = _decode_mime_words(subject_raw)
+            reply_subj  = subject if subject.lower().startswith("re:") else f"Re: {subject}"
+
+            # ── Parse body ───────────────────────────────────────────────────
+            body = _extract_text_body(msg)
+            if not body:
+                print(f"📭 Empty body from {sender_addr} — skipping")
+                mail.uid("store", uid, "+FLAGS", "\\Seen")
+                email_processed.add(uid_str)
+                continue
+
+            print(f"📨 New email from {sender_addr} | Subject: {subject!r}")
+            print(f"   Body preview: {body[:120].replace(chr(10), ' ')}")
+
+            # ── Build / continue conversation ────────────────────────────────
+            # Clean up stale sessions (60 min idle for email)
+            now = datetime.now()
+            for k in [k for k, t in list(email_last_active.items())
+                      if now - t > timedelta(minutes=60)]:
+                email_sessions.pop(k, None)
+                email_last_active.pop(k, None)
+
+            if sender_addr not in email_sessions:
+                email_sessions[sender_addr] = [
+                    {"role": "system", "content": EMAIL_SYSTEM}
+                ]
+            email_last_active[sender_addr] = now
+            email_sessions[sender_addr].append({"role": "user", "content": body})
+
+            # ── Call OpenAI ───────────────────────────────────────────────────
+            ai_reply = call_openai(email_sessions[sender_addr], max_tokens=600)
+            if ai_reply:
+                email_sessions[sender_addr].append(
+                    {"role": "assistant", "content": ai_reply}
+                )
+            else:
+                ai_reply = (
+                    "I'm having a brief technical issue — please reply again in a moment!\n\n"
+                    "Best regards,\nYann's AI Support"
+                )
+
+            # ── Send reply ────────────────────────────────────────────────────
+            msg_id     = msg.get("Message-ID", "")
+            references = msg.get("References", "") or msg_id
+            _send_email_reply(
+                to_email    = sender_addr,
+                subject     = reply_subj,
+                body        = ai_reply,
+                in_reply_to = msg_id,
+                references  = references,
+            )
+
+            # Mark original as read and record UID
+            mail.uid("store", uid, "+FLAGS", "\\Seen")
+            email_processed.add(uid_str)
+            print(f"✅ Reply sent → {sender_addr}")
+
+        mail.logout()
+
+    except imaplib.IMAP4.error as e:
+        print(f"❌ IMAP auth/connection error: {e}")
+    except Exception as e:
+        print(f"❌ Inbox check error: {e}")
+
+
+# ─── Email helpers ─────────────────────────────────────────────────────────────
+
+def _decode_mime_words(s: str) -> str:
+    """Decode RFC 2047 encoded email header words (e.g. =?UTF-8?B?...?=)."""
+    parts = []
+    for raw, charset in _decode_header(s):
+        if isinstance(raw, bytes):
+            parts.append(raw.decode(charset or "utf-8", errors="replace"))
+        else:
+            parts.append(raw)
+    return "".join(parts)
+
+
+def _parse_addr(from_header: str) -> str | None:
+    """
+    Extract a plain email address from a From header like:
+      'John Doe <john@example.com>'  →  'john@example.com'
+      'john@example.com'             →  'john@example.com'
+    """
+    match = re.search(r"<([^>]+)>", from_header)
+    if match:
+        return match.group(1).strip().lower()
+    # Fallback: the whole header might just be an address
+    addr = from_header.strip().lower()
+    return addr if "@" in addr else None
+
+
+def _extract_text_body(msg) -> str:
+    """
+    Pull the plaintext body out of an email.Message object.
+    Strips quoted-reply lines (lines starting with >) so the AI
+    only sees the new message, not the entire thread history.
+    """
+    text = ""
+    if msg.is_multipart():
+        for part in msg.walk():
+            if part.get_content_type() == "text/plain" and \
+               part.get("Content-Disposition") != "attachment":
+                payload = part.get_payload(decode=True)
+                if payload:
+                    charset = part.get_content_charset() or "utf-8"
+                    text = payload.decode(charset, errors="replace")
+                    break
+    else:
+        payload = msg.get_payload(decode=True)
+        if payload:
+            charset = msg.get_content_charset() or "utf-8"
+            text = payload.decode(charset, errors="replace")
+
+    # Strip quoted lines ("> ..." ) and common "On ... wrote:" lines
+    clean_lines = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(">"):
+            continue
+        if re.match(r"^On .+ wrote:$", stripped):
+            break  # Everything after this is a quote
+        clean_lines.append(line)
+
+    return "\n".join(clean_lines).strip()
+
+
+def _send_email_reply(
+    to_email: str,
+    subject: str,
+    body: str,
+    in_reply_to: str = "",
+    references: str = "",
+):
+    """Send an email reply via SMTP, threading it to the original message."""
+    msg            = MIMEMultipart()
+    msg["Subject"] = subject
+    msg["From"]    = SMTP_USER
+    msg["To"]      = to_email
+    if in_reply_to:
+        msg["In-Reply-To"] = in_reply_to
+    if references:
+        msg["References"] = references
+    msg.attach(MIMEText(body, "plain"))
+
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
+        s.starttls()
+        s.login(SMTP_USER, SMTP_PASS)
+        s.sendmail(SMTP_USER, to_email, msg.as_string())
 
 
 # ══════════════════════════════════════════════════════════════════════════════
