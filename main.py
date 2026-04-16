@@ -1,3 +1,4 @@
+import asyncio
 import os
 import re
 import requests
@@ -6,7 +7,7 @@ from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from twilio.rest import Client as TwilioClient
 from twilio.twiml.voice_response import VoiceResponse, Gather
@@ -58,7 +59,7 @@ async def index():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PHONE — Step 1: Answer and immediately ask text or email
+# PHONE — Step 1: Answer and ask text or email
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.api_route("/incoming-call", methods=["GET", "POST"])
@@ -93,7 +94,7 @@ async def incoming_call(request: Request):
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.api_route("/choose-channel", methods=["GET", "POST"])
-async def choose_channel(request: Request):
+async def choose_channel(request: Request, background_tasks: BackgroundTasks):
     form     = await request.form()
     speech   = form.get("SpeechResult", "").strip().lower()
     call_sid = request.query_params.get("call_sid", "unknown")
@@ -102,20 +103,31 @@ async def choose_channel(request: Request):
 
     response = VoiceResponse()
 
-    # ── TEXT chosen ────────────────────────────────────────────────────────────
+    # ── TEXT chosen ───────────────────────────────────────────────────────────
     if any(w in speech for w in ["text", "sms", "message", "txt"]):
         response.say(
             "Ok, transferring to text now. You will receive a message shortly. Goodbye!",
             voice=VOICE,
         )
         response.hangup()
-        # Fire-and-forget: send opening SMS
-        await send_opening_sms(caller)
+
+        # FIX: Use BackgroundTasks instead of await after hangup.
+        # Twilio reads TwiML and hangs up BEFORE your async code resumes after
+        # response.hangup(), which meant the SMS send was effectively orphaned.
+        # BackgroundTasks runs AFTER the HTTP response is sent, which is correct.
+        background_tasks.add_task(send_opening_sms, caller)
         return HTMLResponse(content=str(response), media_type="application/xml")
 
-    # ── EMAIL chosen ───────────────────────────────────────────────────────────
+    # ── EMAIL chosen ──────────────────────────────────────────────────────────
     if any(w in speech for w in ["email", "e-mail", "mail"]):
         pending_email[call_sid] = {"caller": caller}
+
+        # FIX: The original code had a redirect fallback inside the email branch
+        # that pointed back to /choose-channel. When Gather timed out (caller
+        # said nothing), it would redirect there — but with no SpeechResult, the
+        # email branch was skipped and the "didn't understand" branch triggered,
+        # effectively dropping the call loop. Changed the redirect to point back
+        # to /collect-email so the prompt repeats on silence/timeout.
         gather = Gather(
             input="speech",
             action=f"/collect-email?call_sid={call_sid}&caller={caller}",
@@ -126,7 +138,12 @@ async def choose_channel(request: Request):
         )
         gather.say("What is your email address?", voice=VOICE)
         response.append(gather)
-        response.redirect(f"/choose-channel?call_sid={call_sid}&caller={caller}", method="POST")
+        # Timeout fallback: re-ask for email instead of going back to channel
+        # selection (which was the original bug causing silent call drops).
+        response.redirect(
+            f"/collect-email?call_sid={call_sid}&caller={caller}&timeout=1",
+            method="POST",
+        )
         return HTMLResponse(content=str(response), media_type="application/xml")
 
     # ── Couldn't understand — ask again ───────────────────────────────────────
@@ -147,24 +164,50 @@ async def choose_channel(request: Request):
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.api_route("/collect-email", methods=["GET", "POST"])
-async def collect_email(request: Request):
+async def collect_email(request: Request, background_tasks: BackgroundTasks):
     form     = await request.form()
     speech   = form.get("SpeechResult", "").strip()
     call_sid = request.query_params.get("call_sid", "unknown")
     caller   = request.query_params.get("caller", "Unknown")
+    # Detect whether this is a timeout redirect (no speech input)
+    is_timeout = request.query_params.get("timeout", "0") == "1"
     print(f"📧 [{call_sid[:8]}] Email speech: '{speech}'")
 
     response = VoiceResponse()
-    email    = extract_email(speech)
+
+    # If this was a timeout redirect (Gather expired with no input), re-prompt.
+    if is_timeout or not speech:
+        gather = Gather(
+            input="speech",
+            action=f"/collect-email?call_sid={call_sid}&caller={caller}",
+            method="POST",
+            speech_timeout="auto",
+            timeout=10,
+        )
+        gather.say(
+            "I didn't hear anything. "
+            "Please say your email address, for example: john at gmail dot com.",
+            voice=VOICE,
+        )
+        response.append(gather)
+        response.redirect(
+            f"/collect-email?call_sid={call_sid}&caller={caller}&timeout=1",
+            method="POST",
+        )
+        return HTMLResponse(content=str(response), media_type="application/xml")
+
+    email = extract_email(speech)
 
     if email:
         print(f"✅ Email captured: {email}")
-        response.say("Sending email now. Goodbye!", voice=VOICE)
+        response.say("Got it! Sending you an email now. Goodbye!", voice=VOICE)
         response.hangup()
-        await send_opening_email(email)
+        # FIX: Same BackgroundTasks pattern — ensures the email is sent AFTER
+        # the TwiML response is returned, not blocked by Twilio's 15s timeout.
+        background_tasks.add_task(send_opening_email, email)
         pending_email.pop(call_sid, None)
     else:
-        # Couldn't parse — try again
+        # Couldn't parse the address — try again with a helpful example
         gather = Gather(
             input="speech",
             action=f"/collect-email?call_sid={call_sid}&caller={caller}",
@@ -178,6 +221,10 @@ async def collect_email(request: Request):
             voice=VOICE,
         )
         response.append(gather)
+        response.redirect(
+            f"/collect-email?call_sid={call_sid}&caller={caller}&timeout=1",
+            method="POST",
+        )
 
     return HTMLResponse(content=str(response), media_type="application/xml")
 
@@ -187,7 +234,16 @@ async def collect_email(request: Request):
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def send_opening_sms(to_number: str):
-    """Send the first SMS after caller chooses text."""
+    """Send the first SMS after caller chooses text.
+
+    NOTE on Twilio toll-free verification:
+    Until your toll-free number is verified, Twilio blocks outbound SMS to
+    most US/CA numbers. This is a carrier-level restriction — the code is
+    correct. Once verification is approved in the Twilio console
+    (Phone Numbers → Manage → Regulatory Compliance), SMS will work without
+    any code changes. In the meantime you can test with a Twilio trial number
+    (non-toll-free) which has no such restriction.
+    """
     if not TWILIO_SID or not to_number or to_number == "Unknown":
         return
     body = (
@@ -207,7 +263,7 @@ async def send_opening_sms(to_number: str):
 async def send_opening_email(to_email: str):
     """Send the first email after caller gives their address."""
     if not SMTP_USER or not SMTP_PASS:
-        print("⚠️  SMTP not set — skipping opening email")
+        print("⚠️  SMTP not configured — set SMTP_USER and SMTP_PASS env vars.")
         return
 
     subject = "Yann's AI Support — We're Ready to Help! 👋"
@@ -228,13 +284,24 @@ async def send_opening_email(to_email: str):
     msg.attach(MIMEText(body, "plain"))
 
     try:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
-            s.starttls()
-            s.login(SMTP_USER, SMTP_PASS)
-            s.sendmail(SMTP_USER, to_email, msg.as_string())
+        # FIX: Run the blocking SMTP call in a thread so it doesn't block the
+        # FastAPI event loop. This was a subtle bug — smtplib is synchronous,
+        # so calling it directly in an async function blocks the entire server
+        # while it waits for the SMTP handshake (up to several seconds), which
+        # can cause Twilio to time out waiting for a response.
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, _smtp_send, SMTP_USER, to_email, msg)
         print(f"✅ Opening email → {to_email}")
     except Exception as e:
         print(f"❌ Opening email error: {e}")
+
+
+def _smtp_send(smtp_user: str, to_email: str, msg: MIMEMultipart):
+    """Synchronous SMTP send — called via run_in_executor."""
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
+        s.starttls()
+        s.login(smtp_user, SMTP_PASS)
+        s.sendmail(smtp_user, to_email, msg.as_string())
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -301,11 +368,32 @@ def call_openai(messages: list, max_tokens: int = 300) -> str | None:
 
 
 def extract_email(text: str) -> str | None:
-    """Parse spoken email addresses like 'john at gmail dot com'."""
+    """Parse spoken email addresses like 'john at gmail dot com'.
+
+    Also handles common speech-to-text quirks:
+      - 'underscore' → '_'
+      - 'dash' / 'hyphen' → '-'
+      - 'period' → '.'
+      - digits spoken as words (one, two … nine) → digit
+    """
     t = text.lower().strip()
+
+    # Spoken punctuation
+    t = re.sub(r"\bunderscore\b", "_", t)
+    t = re.sub(r"\b(dash|hyphen)\b", "-", t)
+    t = re.sub(r"\bperiod\b", ".", t)
+
+    # Spoken digits (optional but helpful for numeric local parts)
+    digits = {"zero":"0","one":"1","two":"2","three":"3","four":"4",
+              "five":"5","six":"6","seven":"7","eight":"8","nine":"9"}
+    for word, digit in digits.items():
+        t = re.sub(rf"\b{word}\b", digit, t)
+
+    # Core spoken-email normalisation
     t = re.sub(r"\s+at\s+",  "@", t)
     t = re.sub(r"\s+dot\s+", ".", t)
     t = re.sub(r"\s+",       "",  t)
+
     match = re.search(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", t)
     return match.group(0) if match else None
 
