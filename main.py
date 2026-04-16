@@ -68,6 +68,92 @@ async def index():
     }
 
 
+# ─── Diagnostic test endpoint ─────────────────────────────────────────────────
+# Call GET /test?to=your@email.com to:
+#   1. Verify all env vars are set
+#   2. Test SMTP (send a real email)
+#   3. Test IMAP connection
+#   4. Test OpenAI
+# This lets you debug without a phone call.
+@app.get("/test")
+async def test_all(to: str = ""):
+    results = {}
+
+    # ── Env vars ──────────────────────────────────────────────────────────────
+    results["env"] = {
+        "OPENAI_API_KEY": "✅ set" if OPENAI_API_KEY else "❌ MISSING",
+        "TWILIO_SID":     "✅ set" if TWILIO_SID     else "❌ MISSING",
+        "SMTP_USER":      SMTP_USER if SMTP_USER      else "❌ MISSING",
+        "SMTP_PASS":      "✅ set"  if SMTP_PASS      else "❌ MISSING",
+        "IMAP_HOST":      IMAP_HOST,
+    }
+
+    # ── SMTP test ─────────────────────────────────────────────────────────────
+    if SMTP_USER and SMTP_PASS and to:
+        try:
+            import smtplib
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
+                s.starttls()
+                s.login(SMTP_USER, SMTP_PASS)
+            results["smtp"] = "✅ login OK"
+
+            # Send a real test email
+            msg               = MIMEMultipart()
+            msg["Subject"]    = "Yann's AI Support — Test Email"
+            msg["From"]       = SMTP_USER
+            msg["To"]         = to
+            msg["Message-ID"] = email_utils.make_msgid(
+                domain=SMTP_USER.split("@")[1] if "@" in SMTP_USER else "mail"
+            )
+            msg.attach(MIMEText(
+                "Hey there!\n\nThis is Yann's AI Support.\n\n"
+                "What do you need my friend? 😊\n\n"
+                "Just reply to this email with your question!\n\n"
+                "Best regards,\nYann's AI Support",
+                "plain"
+            ))
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, _smtp_send, to, msg.as_string())
+            results["smtp_send"] = f"✅ test email sent to {to}"
+        except Exception as e:
+            results["smtp"] = f"❌ {e}"
+    elif not to:
+        results["smtp"] = "⚠️  add ?to=your@email.com to send a test email"
+    else:
+        results["smtp"] = "❌ SMTP_USER or SMTP_PASS not set"
+
+    # ── IMAP test ─────────────────────────────────────────────────────────────
+    if SMTP_USER and SMTP_PASS:
+        try:
+            import imaplib
+            mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
+            mail.login(SMTP_USER, SMTP_PASS)
+            mail.select("INBOX")
+            _, data = mail.uid("search", None, "UNSEEN")
+            unseen = len(data[0].split()) if data[0] else 0
+            mail.logout()
+            results["imap"] = f"✅ connected — {unseen} unseen email(s) in inbox"
+        except Exception as e:
+            results["imap"] = f"❌ {e}"
+    else:
+        results["imap"] = "❌ SMTP_USER or SMTP_PASS not set"
+
+    # ── OpenAI test ───────────────────────────────────────────────────────────
+    if OPENAI_API_KEY:
+        try:
+            reply = call_openai(
+                [{"role": "user", "content": "Say 'OpenAI OK' and nothing else."}],
+                max_tokens=10
+            )
+            results["openai"] = f"✅ {reply}"
+        except Exception as e:
+            results["openai"] = f"❌ {e}"
+    else:
+        results["openai"] = "❌ OPENAI_API_KEY not set"
+
+    return results
+
+
 # ─── Startup ──────────────────────────────────────────────────────────────────
 @app.on_event("startup")
 async def startup_event():
