@@ -60,13 +60,8 @@ email_sessions:    dict = {}  # sender_email → [messages]
 email_last_active: dict = {}  # sender_email → datetime
 # UIDs already handled — prevents double-processing within a session
 email_processed: set = set()
-# Message-IDs of emails the bot has sent — we ONLY reply to emails whose
-# In-Reply-To matches one of these. This stops the bot from replying to
-# marketing emails, newsletters, or anything else in the inbox.
-# PERSISTED to disk so server restarts don't lose track of past sent emails.
-sent_message_ids: set  = set()
-# Set to True after the first poll drains the backlog without replying
-email_startup_done: bool = False
+# Message-IDs of emails the bot has sent — persisted to disk
+sent_message_ids: set = set()
 
 
 def _load_sent_ids():
@@ -143,46 +138,28 @@ async def email_inbox_poller():
 def _check_and_reply_inbox():
     """
     Synchronous: connect to Gmail via IMAP, find UNSEEN emails,
-    generate AI replies, send them, and mark originals as read.
+    and reply only to messages that are genuine replies to the bot.
 
-    Guard rails (in order):
-      1. First-run drain  — on startup, skip ALL existing unread emails
-                            so the bot doesn't reply to your whole backlog.
-      2. In-Reply-To check — only reply to emails whose In-Reply-To / References
-                            header matches a Message-ID the bot itself sent.
-                            This means marketing emails, newsletters, and random
-                            incoming mail are NEVER replied to.
-      3. Automated filter — extra safety net: drop bulk/list/noreply emails.
+    Two guards prevent spam:
+      1. In-Reply-To check — only reply to emails whose In-Reply-To / References
+                            header matches a Message-ID the bot itself sent
+                            (stored in sent_message_ids.json on disk).
+      2. Automated filter — blocks bulk/list/noreply/marketing emails.
     """
-    global email_startup_done
-
     try:
         mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
         mail.login(SMTP_USER, SMTP_PASS)
         mail.select("INBOX")
 
-        # Fetch all UNSEEN email UIDs
         _, data = mail.uid("search", None, "UNSEEN")
         uids = data[0].split() if data[0] else []
-
-        # ── First-run: drain backlog ───────────────────────────────────────────
-        # On startup there may be thousands of old unread emails. Add all their
-        # UIDs to email_processed so they're never touched again this session,
-        # then return without replying to any of them.
-        if not email_startup_done:
-            for uid in uids:
-                email_processed.add(uid.decode())
-            email_startup_done = True
-            print(f"📬 Inbox initialized — {len(uids)} existing unread email(s) skipped (backlog drain)")
-            mail.logout()
-            return
+        print(f"🔍 Inbox poll: {len(uids)} UNSEEN email(s)")
 
         for uid in uids:
             uid_str = uid.decode()
             if uid_str in email_processed:
                 continue
 
-            # Fetch full message
             _, msg_data = mail.uid("fetch", uid, "(RFC822)")
             if not msg_data or not msg_data[0]:
                 continue
@@ -204,11 +181,19 @@ def _check_and_reply_inbox():
                 mail.uid("store", uid, "+FLAGS", "\\Seen")
                 continue
 
-            # ── Guard 1: must be a reply to one of our emails ─────────────────
-            # Check In-Reply-To and References headers for a Message-ID we sent.
-            in_reply_to = msg.get("In-Reply-To", "").strip()
-            references  = msg.get("References",  "").strip()
+            # ── Guard 1: automated/marketing filter ───────────────────────────
+            if _is_automated_email(msg, sender_addr):
+                print(f"⏭️  Skipping {sender_addr} — automated/bulk email")
+                email_processed.add(uid_str)
+                mail.uid("store", uid, "+FLAGS", "\\Seen")
+                continue
+
+            # ── Guard 2: must be a reply to one of our emails ─────────────────
+            in_reply_to   = msg.get("In-Reply-To", "").strip()
+            references    = msg.get("References",  "").strip()
             combined_refs = f"{in_reply_to} {references}"
+            print(f"   From: {sender_addr} | In-Reply-To: {in_reply_to[:60] if in_reply_to else '(none)'}")
+            print(f"   Known sent IDs: {len(sent_message_ids)}")
 
             is_reply_to_bot = any(
                 mid and mid in combined_refs
@@ -220,19 +205,11 @@ def _check_and_reply_inbox():
                 mail.uid("store", uid, "+FLAGS", "\\Seen")
                 continue
 
-            # ── Guard 2: automated/marketing email filter ─────────────────────
-            if _is_automated_email(msg, sender_addr):
-                print(f"⏭️  Skipping {sender_addr} — looks automated/bulk")
-                email_processed.add(uid_str)
-                mail.uid("store", uid, "+FLAGS", "\\Seen")
-                continue
-
-            # ── Parse subject ────────────────────────────────────────────────
+            # ── Parse subject & body ──────────────────────────────────────────
             subject_raw = msg.get("Subject", "No Subject")
             subject     = _decode_mime_words(subject_raw)
             reply_subj  = subject if subject.lower().startswith("re:") else f"Re: {subject}"
 
-            # ── Parse body ───────────────────────────────────────────────────
             body = _extract_text_body(msg)
             if not body:
                 print(f"📭 Empty body from {sender_addr} — skipping")
@@ -243,7 +220,7 @@ def _check_and_reply_inbox():
             print(f"📨 Reply from {sender_addr} | Subject: {subject!r}")
             print(f"   Body preview: {body[:120].replace(chr(10), ' ')}")
 
-            # ── Build / continue conversation ────────────────────────────────
+            # ── Build / continue conversation ─────────────────────────────────
             now = datetime.now()
             for k in [k for k, t in list(email_last_active.items())
                       if now - t > timedelta(minutes=60)]:
