@@ -1,5 +1,6 @@
 import asyncio
 import email as email_lib
+import email.utils as email_utils
 import imaplib
 import os
 import re
@@ -54,9 +55,14 @@ sms_last_active: dict = {}   # phone_number → datetime
 # ─── Email session memory ─────────────────────────────────────────────────────
 email_sessions:    dict = {}  # sender_email → [messages]
 email_last_active: dict = {}  # sender_email → datetime
-# Tracks Gmail UIDs already replied to (avoids double-replies on restart gaps).
-# Stored as a set of IMAP UID strings.
+# UIDs already handled — prevents double-processing within a session
 email_processed: set = set()
+# Message-IDs of emails the bot has sent — we ONLY reply to emails whose
+# In-Reply-To matches one of these. This stops the bot from replying to
+# marketing emails, newsletters, or anything else in the inbox.
+sent_message_ids: set  = set()
+# Set to True after the first poll drains the backlog without replying
+email_startup_done: bool = False
 
 # ─── Pending email collection (from phone call) ───────────────────────────────
 pending_email: dict = {}     # call_sid → {"caller": "+1...", "stage": "collecting"}
@@ -106,7 +112,18 @@ def _check_and_reply_inbox():
     """
     Synchronous: connect to Gmail via IMAP, find UNSEEN emails,
     generate AI replies, send them, and mark originals as read.
+
+    Guard rails (in order):
+      1. First-run drain  — on startup, skip ALL existing unread emails
+                            so the bot doesn't reply to your whole backlog.
+      2. In-Reply-To check — only reply to emails whose In-Reply-To / References
+                            header matches a Message-ID the bot itself sent.
+                            This means marketing emails, newsletters, and random
+                            incoming mail are NEVER replied to.
+      3. Automated filter — extra safety net: drop bulk/list/noreply emails.
     """
+    global email_startup_done
+
     try:
         mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
         mail.login(SMTP_USER, SMTP_PASS)
@@ -116,15 +133,24 @@ def _check_and_reply_inbox():
         _, data = mail.uid("search", None, "UNSEEN")
         uids = data[0].split() if data[0] else []
 
+        # ── First-run: drain backlog ───────────────────────────────────────────
+        # On startup there may be thousands of old unread emails. Add all their
+        # UIDs to email_processed so they're never touched again this session,
+        # then return without replying to any of them.
+        if not email_startup_done:
+            for uid in uids:
+                email_processed.add(uid.decode())
+            email_startup_done = True
+            print(f"📬 Inbox initialized — {len(uids)} existing unread email(s) skipped (backlog drain)")
+            mail.logout()
+            return
+
         for uid in uids:
             uid_str = uid.decode()
-
-            # Skip if we already processed this UID in a previous poll
             if uid_str in email_processed:
-                mail.uid("store", uid, "+FLAGS", "\\Seen")
                 continue
 
-            # Fetch the full RFC822 message
+            # Fetch full message
             _, msg_data = mail.uid("fetch", uid, "(RFC822)")
             if not msg_data or not msg_data[0]:
                 continue
@@ -135,14 +161,38 @@ def _check_and_reply_inbox():
             from_raw    = msg.get("From", "")
             sender_addr = _parse_addr(from_raw)
             if not sender_addr:
-                print(f"⚠️  Could not parse sender from: {from_raw!r} — skipping")
+                print(f"⚠️  Could not parse sender: {from_raw!r} — skipping")
+                email_processed.add(uid_str)
                 mail.uid("store", uid, "+FLAGS", "\\Seen")
                 continue
 
-            # Don't reply to our own sent emails (avoids infinite loops)
+            # Never reply to ourselves
             if sender_addr.lower() == SMTP_USER.lower():
-                mail.uid("store", uid, "+FLAGS", "\\Seen")
                 email_processed.add(uid_str)
+                mail.uid("store", uid, "+FLAGS", "\\Seen")
+                continue
+
+            # ── Guard 1: must be a reply to one of our emails ─────────────────
+            # Check In-Reply-To and References headers for a Message-ID we sent.
+            in_reply_to = msg.get("In-Reply-To", "").strip()
+            references  = msg.get("References",  "").strip()
+            combined_refs = f"{in_reply_to} {references}"
+
+            is_reply_to_bot = any(
+                mid and mid in combined_refs
+                for mid in sent_message_ids
+            )
+            if not is_reply_to_bot:
+                print(f"⏭️  Skipping {sender_addr} — not a reply to one of our emails")
+                email_processed.add(uid_str)
+                mail.uid("store", uid, "+FLAGS", "\\Seen")
+                continue
+
+            # ── Guard 2: automated/marketing email filter ─────────────────────
+            if _is_automated_email(msg, sender_addr):
+                print(f"⏭️  Skipping {sender_addr} — looks automated/bulk")
+                email_processed.add(uid_str)
+                mail.uid("store", uid, "+FLAGS", "\\Seen")
                 continue
 
             # ── Parse subject ────────────────────────────────────────────────
@@ -154,15 +204,14 @@ def _check_and_reply_inbox():
             body = _extract_text_body(msg)
             if not body:
                 print(f"📭 Empty body from {sender_addr} — skipping")
-                mail.uid("store", uid, "+FLAGS", "\\Seen")
                 email_processed.add(uid_str)
+                mail.uid("store", uid, "+FLAGS", "\\Seen")
                 continue
 
-            print(f"📨 New email from {sender_addr} | Subject: {subject!r}")
+            print(f"📨 Reply from {sender_addr} | Subject: {subject!r}")
             print(f"   Body preview: {body[:120].replace(chr(10), ' ')}")
 
             # ── Build / continue conversation ────────────────────────────────
-            # Clean up stale sessions (60 min idle for email)
             now = datetime.now()
             for k in [k for k, t in list(email_last_active.items())
                       if now - t > timedelta(minutes=60)]:
@@ -199,7 +248,6 @@ def _check_and_reply_inbox():
                 references  = references,
             )
 
-            # Mark original as read and record UID
             mail.uid("store", uid, "+FLAGS", "\\Seen")
             email_processed.add(uid_str)
             print(f"✅ Reply sent → {sender_addr}")
@@ -213,6 +261,38 @@ def _check_and_reply_inbox():
 
 
 # ─── Email helpers ─────────────────────────────────────────────────────────────
+
+def _is_automated_email(msg, sender_addr: str) -> bool:
+    """
+    Return True if this email looks automated, bulk, or marketing.
+    Used as a secondary safety net — the primary guard is the
+    In-Reply-To / sent_message_ids check.
+    """
+    # List-Unsubscribe is the clearest signal of a mailing-list / marketing email
+    if msg.get("List-Unsubscribe") or msg.get("List-ID"):
+        return True
+    # Precedence header
+    precedence = (msg.get("Precedence") or "").lower().strip()
+    if precedence in ("bulk", "list", "junk"):
+        return True
+    # Auto-Submitted header (auto-replies, out-of-office, delivery reports)
+    auto_sub = (msg.get("Auto-Submitted") or "").lower().strip()
+    if auto_sub and auto_sub != "no":
+        return True
+    # X-Mailer hints for bulk platforms
+    x_mailer = (msg.get("X-Mailer") or "").lower()
+    if any(k in x_mailer for k in ("mailchimp", "sendgrid", "marketo", "salesforce", "hubspot")):
+        return True
+    # Sender address patterns that indicate automated mail
+    local = sender_addr.split("@")[0].lower()
+    auto_patterns = (
+        "noreply", "no-reply", "donotreply", "do-not-reply",
+        "notifications", "newsletter", "mailer-daemon",
+        "postmaster", "bounce", "automailer",
+    )
+    if any(p in local for p in auto_patterns):
+        return True
+    return False
 
 def _decode_mime_words(s: str) -> str:
     """Decode RFC 2047 encoded email header words (e.g. =?UTF-8?B?...?=)."""
@@ -281,11 +361,19 @@ def _send_email_reply(
     in_reply_to: str = "",
     references: str = "",
 ):
-    """Send an email reply via SMTP, threading it to the original message."""
-    msg            = MIMEMultipart()
-    msg["Subject"] = subject
-    msg["From"]    = SMTP_USER
-    msg["To"]      = to_email
+    """Send an email reply via SMTP, threading it to the original message.
+    The generated Message-ID is saved to sent_message_ids so that when
+    the recipient replies, the poller recognises it as a legitimate conversation.
+    """
+    # Generate a unique Message-ID for this outgoing email
+    domain  = SMTP_USER.split("@")[1] if "@" in SMTP_USER else "mail"
+    new_mid = email_utils.make_msgid(domain=domain)
+
+    msg                = MIMEMultipart()
+    msg["Subject"]     = subject
+    msg["From"]        = SMTP_USER
+    msg["To"]          = to_email
+    msg["Message-ID"]  = new_mid
     if in_reply_to:
         msg["In-Reply-To"] = in_reply_to
     if references:
@@ -296,6 +384,9 @@ def _send_email_reply(
         s.starttls()
         s.login(SMTP_USER, SMTP_PASS)
         s.sendmail(SMTP_USER, to_email, msg.as_string())
+
+    # Track this Message-ID so replies to it are recognised as conversations
+    sent_message_ids.add(new_mid)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -493,7 +584,10 @@ async def send_opening_sms(to_number: str):
 
 
 async def send_opening_email(to_email: str):
-    """Send the first email after caller gives their address."""
+    """Send the first email after caller gives their address.
+    Saves the outgoing Message-ID to sent_message_ids so the poller
+    knows to accept replies from this person.
+    """
     if not SMTP_USER or not SMTP_PASS:
         print("⚠️  SMTP not configured — set SMTP_USER and SMTP_PASS env vars.")
         return
@@ -509,31 +603,32 @@ async def send_opening_email(to_email: str):
         "Yann's AI Support"
     )
 
-    msg            = MIMEMultipart()
-    msg["Subject"] = subject
-    msg["From"]    = SMTP_USER
-    msg["To"]      = to_email
+    domain  = SMTP_USER.split("@")[1] if "@" in SMTP_USER else "mail"
+    new_mid = email_utils.make_msgid(domain=domain)
+
+    msg               = MIMEMultipart()
+    msg["Subject"]    = subject
+    msg["From"]       = SMTP_USER
+    msg["To"]         = to_email
+    msg["Message-ID"] = new_mid
     msg.attach(MIMEText(body, "plain"))
 
     try:
-        # FIX: Run the blocking SMTP call in a thread so it doesn't block the
-        # FastAPI event loop. This was a subtle bug — smtplib is synchronous,
-        # so calling it directly in an async function blocks the entire server
-        # while it waits for the SMTP handshake (up to several seconds), which
-        # can cause Twilio to time out waiting for a response.
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, _smtp_send, SMTP_USER, to_email, msg)
-        print(f"✅ Opening email → {to_email}")
+        await loop.run_in_executor(None, _smtp_send_raw, to_email, msg)
+        # Track so the poller accepts replies from this person
+        sent_message_ids.add(new_mid)
+        print(f"✅ Opening email → {to_email} (Message-ID: {new_mid})")
     except Exception as e:
         print(f"❌ Opening email error: {e}")
 
 
-def _smtp_send(smtp_user: str, to_email: str, msg: MIMEMultipart):
+def _smtp_send_raw(to_email: str, msg: MIMEMultipart):
     """Synchronous SMTP send — called via run_in_executor."""
     with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
         s.starttls()
-        s.login(smtp_user, SMTP_PASS)
-        s.sendmail(smtp_user, to_email, msg.as_string())
+        s.login(SMTP_USER, SMTP_PASS)
+        s.sendmail(SMTP_USER, to_email, msg.as_string())
 
 
 # ══════════════════════════════════════════════════════════════════════════════
