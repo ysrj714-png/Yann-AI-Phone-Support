@@ -6,6 +6,7 @@ import smtplib
 from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from urllib.parse import quote, unquote
 
 from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import HTMLResponse, PlainTextResponse
@@ -69,10 +70,14 @@ async def incoming_call(request: Request):
     caller   = form.get("From", "Unknown")
     print(f"📞 Call from {caller} | SID: {call_sid}")
 
+    # URL-encode caller so the + in +1XXXXXXXXXX doesn't become a space
+    safe_caller   = quote(caller, safe="")
+    safe_call_sid = quote(call_sid, safe="")
+
     response = VoiceResponse()
     gather   = Gather(
         input="speech",
-        action=f"/choose-channel?call_sid={call_sid}&caller={caller}",
+        action=f"/choose-channel?call_sid={safe_call_sid}&caller={safe_caller}",
         method="POST",
         speech_timeout="auto",
         timeout=6,
@@ -97,8 +102,11 @@ async def incoming_call(request: Request):
 async def choose_channel(request: Request, background_tasks: BackgroundTasks):
     form     = await request.form()
     speech   = form.get("SpeechResult", "").strip().lower()
-    call_sid = request.query_params.get("call_sid", "unknown")
-    caller   = request.query_params.get("caller", "Unknown")
+    # unquote decodes %2B back to + so we have the real phone number
+    call_sid = unquote(request.query_params.get("call_sid", "unknown"))
+    caller   = unquote(request.query_params.get("caller", "Unknown"))
+    safe_caller   = quote(caller, safe="")
+    safe_call_sid = quote(call_sid, safe="")
     print(f"📲 [{call_sid[:8]}] Channel choice: '{speech}'")
 
     response = VoiceResponse()
@@ -110,27 +118,15 @@ async def choose_channel(request: Request, background_tasks: BackgroundTasks):
             voice=VOICE,
         )
         response.hangup()
-
-        # FIX: Use BackgroundTasks instead of await after hangup.
-        # Twilio reads TwiML and hangs up BEFORE your async code resumes after
-        # response.hangup(), which meant the SMS send was effectively orphaned.
-        # BackgroundTasks runs AFTER the HTTP response is sent, which is correct.
         background_tasks.add_task(send_opening_sms, caller)
         return HTMLResponse(content=str(response), media_type="application/xml")
 
     # ── EMAIL chosen ──────────────────────────────────────────────────────────
     if any(w in speech for w in ["email", "e-mail", "mail"]):
         pending_email[call_sid] = {"caller": caller}
-
-        # FIX: The original code had a redirect fallback inside the email branch
-        # that pointed back to /choose-channel. When Gather timed out (caller
-        # said nothing), it would redirect there — but with no SpeechResult, the
-        # email branch was skipped and the "didn't understand" branch triggered,
-        # effectively dropping the call loop. Changed the redirect to point back
-        # to /collect-email so the prompt repeats on silence/timeout.
         gather = Gather(
             input="speech",
-            action=f"/collect-email?call_sid={call_sid}&caller={caller}",
+            action=f"/collect-email?call_sid={safe_call_sid}&caller={safe_caller}",
             method="POST",
             speech_timeout="auto",
             timeout=10,
@@ -138,10 +134,8 @@ async def choose_channel(request: Request, background_tasks: BackgroundTasks):
         )
         gather.say("What is your email address?", voice=VOICE)
         response.append(gather)
-        # Timeout fallback: re-ask for email instead of going back to channel
-        # selection (which was the original bug causing silent call drops).
         response.redirect(
-            f"/collect-email?call_sid={call_sid}&caller={caller}&timeout=1",
+            f"/collect-email?call_sid={safe_call_sid}&caller={safe_caller}&timeout=1",
             method="POST",
         )
         return HTMLResponse(content=str(response), media_type="application/xml")
@@ -149,7 +143,7 @@ async def choose_channel(request: Request, background_tasks: BackgroundTasks):
     # ── Couldn't understand — ask again ───────────────────────────────────────
     gather = Gather(
         input="speech",
-        action=f"/choose-channel?call_sid={call_sid}&caller={caller}",
+        action=f"/choose-channel?call_sid={safe_call_sid}&caller={safe_caller}",
         method="POST",
         speech_timeout="auto",
         timeout=6,
@@ -167,9 +161,10 @@ async def choose_channel(request: Request, background_tasks: BackgroundTasks):
 async def collect_email(request: Request, background_tasks: BackgroundTasks):
     form     = await request.form()
     speech   = form.get("SpeechResult", "").strip()
-    call_sid = request.query_params.get("call_sid", "unknown")
-    caller   = request.query_params.get("caller", "Unknown")
-    # Detect whether this is a timeout redirect (no speech input)
+    call_sid = unquote(request.query_params.get("call_sid", "unknown"))
+    caller   = unquote(request.query_params.get("caller", "Unknown"))
+    safe_caller   = quote(caller, safe="")
+    safe_call_sid = quote(call_sid, safe="")
     is_timeout = request.query_params.get("timeout", "0") == "1"
     print(f"📧 [{call_sid[:8]}] Email speech: '{speech}'")
 
@@ -179,7 +174,7 @@ async def collect_email(request: Request, background_tasks: BackgroundTasks):
     if is_timeout or not speech:
         gather = Gather(
             input="speech",
-            action=f"/collect-email?call_sid={call_sid}&caller={caller}",
+            action=f"/collect-email?call_sid={safe_call_sid}&caller={safe_caller}",
             method="POST",
             speech_timeout="auto",
             timeout=10,
@@ -191,7 +186,7 @@ async def collect_email(request: Request, background_tasks: BackgroundTasks):
         )
         response.append(gather)
         response.redirect(
-            f"/collect-email?call_sid={call_sid}&caller={caller}&timeout=1",
+            f"/collect-email?call_sid={safe_call_sid}&caller={safe_caller}&timeout=1",
             method="POST",
         )
         return HTMLResponse(content=str(response), media_type="application/xml")
@@ -202,15 +197,13 @@ async def collect_email(request: Request, background_tasks: BackgroundTasks):
         print(f"✅ Email captured: {email}")
         response.say("Got it! Sending you an email now. Goodbye!", voice=VOICE)
         response.hangup()
-        # FIX: Same BackgroundTasks pattern — ensures the email is sent AFTER
-        # the TwiML response is returned, not blocked by Twilio's 15s timeout.
         background_tasks.add_task(send_opening_email, email)
         pending_email.pop(call_sid, None)
     else:
         # Couldn't parse the address — try again with a helpful example
         gather = Gather(
             input="speech",
-            action=f"/collect-email?call_sid={call_sid}&caller={caller}",
+            action=f"/collect-email?call_sid={safe_call_sid}&caller={safe_caller}",
             method="POST",
             speech_timeout="auto",
             timeout=10,
@@ -222,7 +215,7 @@ async def collect_email(request: Request, background_tasks: BackgroundTasks):
         )
         response.append(gather)
         response.redirect(
-            f"/collect-email?call_sid={call_sid}&caller={caller}&timeout=1",
+            f"/collect-email?call_sid={safe_call_sid}&caller={safe_caller}&timeout=1",
             method="POST",
         )
 
