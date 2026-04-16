@@ -141,11 +141,24 @@ async def test_all(to: str = ""):
     # ── OpenAI test ───────────────────────────────────────────────────────────
     if OPENAI_API_KEY:
         try:
-            reply = call_openai(
-                [{"role": "user", "content": "Say 'OpenAI OK' and nothing else."}],
-                max_tokens=10
+            resp = requests.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {OPENAI_API_KEY}",
+                    "Content-Type":  "application/json",
+                },
+                json={
+                    "model":      "gpt-4o",
+                    "messages":   [{"role": "user", "content": "Say OK"}],
+                    "max_tokens": 5,
+                },
+                timeout=15,
             )
+            resp.raise_for_status()
+            reply = resp.json()["choices"][0]["message"]["content"].strip()
             results["openai"] = f"✅ {reply}"
+        except requests.exceptions.HTTPError:
+            results["openai"] = f"❌ HTTP {resp.status_code}: {resp.text[:200]}"
         except Exception as e:
             results["openai"] = f"❌ {e}"
     else:
@@ -378,10 +391,13 @@ def _check_inbox():
         mail.login(SMTP_USER, SMTP_PASS)
         mail.select("INBOX")
 
-        _, data = mail.uid("search", None, "UNSEEN")
+        # Only look at emails from the last 7 days — avoids processing
+        # the entire backlog (you have 32k+ unseen emails which caused timeouts)
+        since = (datetime.now() - timedelta(days=7)).strftime("%d-%b-%Y")
+        _, data = mail.uid("search", None, f"UNSEEN SINCE {since}")
         uids = data[0].split() if data[0] else []
         if uids:
-            print(f"🔍 {len(uids)} unseen email(s)")
+            print(f"🔍 {len(uids)} recent unseen email(s)")
 
         for uid in uids:
             uid_str = uid.decode()
@@ -625,6 +641,9 @@ def call_openai(messages: list, max_tokens: int = 300) -> str | None:
         )
         resp.raise_for_status()
         return resp.json()["choices"][0]["message"]["content"].strip()
+    except requests.exceptions.HTTPError as e:
+        print(f"❌ OpenAI HTTP error {resp.status_code}: {resp.text[:200]}")
+        return None
     except Exception as e:
         print(f"❌ OpenAI error: {e}")
         return None
