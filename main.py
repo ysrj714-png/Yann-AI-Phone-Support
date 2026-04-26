@@ -633,75 +633,8 @@ def _smtp_send(to_email: str, raw_msg: str):
 # WEATHER & LOCATION TOOLS (for OpenAI function calling)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def web_search(query: str) -> str:
-    """Search the web using DuckDuckGo — free, no API key needed."""
-    try:
-        # DuckDuckGo Instant Answer API
-        resp = requests.get(
-            "https://api.duckduckgo.com/",
-            params={"q": query, "format": "json", "no_html": "1", "skip_disambig": "1"},
-            timeout=10,
-            headers={"User-Agent": "Mozilla/5.0"}
-        )
-        resp.raise_for_status()
-        data = resp.json()
-
-        results = []
-
-        # Abstract (best single answer)
-        if data.get("AbstractText"):
-            results.append(data["AbstractText"])
-
-        # Answer (e.g. "Barack Obama" for "who is president")
-        if data.get("Answer"):
-            results.append(data["Answer"])
-
-        # Related topics
-        for topic in data.get("RelatedTopics", [])[:3]:
-            if isinstance(topic, dict) and topic.get("Text"):
-                results.append(topic["Text"])
-
-        if results:
-            return "\n".join(results)
-
-        # Fallback: DuckDuckGo HTML search for broader queries
-        resp2 = requests.get(
-            "https://html.duckduckgo.com/html/",
-            params={"q": query},
-            timeout=10,
-            headers={"User-Agent": "Mozilla/5.0"}
-        )
-        # Extract first result snippets
-        from bs4 import BeautifulSoup
-        soup = BeautifulSoup(resp2.text, "html.parser")
-        snippets = [r.get_text(strip=True) for r in soup.select(".result__snippet")[:3]]
-        if snippets:
-            return "\n".join(snippets)
-
-        return f"No results found for: {query}"
-    except Exception as e:
-        return f"Search failed: {e}"
-
-
 # Tool definitions passed to OpenAI
 AI_TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "web_search",
-            "description": "Search the web for current, real-time information. Use for: current events, who is president, today's news, recent sports scores, stock prices, weather, or anything that may have changed recently.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "The search query, e.g. 'who is the president of the United States 2025'",
-                    }
-                },
-                "required": ["query"],
-            },
-        },
-    },
     {
         "type": "function",
         "function": {
@@ -800,12 +733,11 @@ def call_openai_with_tools(messages: list, max_tokens: int = 300) -> str | None:
                 "Content-Type":  "application/json",
             },
             json={
-                "model":       "gpt-4o",
+                "model":       "gpt-4o-search-preview",
                 "messages":    messages,
                 "tools":       AI_TOOLS,
                 "tool_choice": "auto",
                 "max_tokens":  max_tokens,
-                "temperature": 0.75,
             },
             timeout=25,
         )
@@ -826,9 +758,7 @@ def call_openai_with_tools(messages: list, max_tokens: int = 300) -> str | None:
             fn_args = json.loads(tc["function"]["arguments"])
             print(f"🔧 Tool call: {fn_name}({fn_args})")
 
-            if fn_name == "web_search":
-                tool_result = web_search(fn_args.get("query", ""))
-            elif fn_name == "get_weather":
+            if fn_name == "get_weather":
                 tool_result = get_weather(fn_args.get("location", ""))
             elif fn_name == "get_location_from_ip":
                 tool_result = get_location_from_ip()
