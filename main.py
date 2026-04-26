@@ -490,15 +490,31 @@ def _check_inbox():
         mail.login(SMTP_USER, SMTP_PASS)
         mail.select("INBOX")
 
-        # Search only today — reliable, simple, avoids the 31k backlog
+        # Search today's unseen emails — avoids the 31k backlog
         today = datetime.now().strftime("%d-%b-%Y")
         _, data = mail.uid("search", None, f"UNSEEN SINCE {today}")
-        uids = data[0].split() if data[0] else []
-        print(f"🔍 {len(uids)} unseen email(s) today")
+        all_today_uids = set(data[0].split()) if data[0] else set()
+
+        # ALSO search specifically for unseen emails FROM known session senders
+        # so active conversations are NEVER missed even if inbox gets flooded
+        priority_uids = set()
+        for known_sender in list(email_sessions.keys()):
+            try:
+                _, d2 = mail.uid("search", None,
+                    f'UNSEEN FROM "{known_sender}"')
+                if d2[0]:
+                    priority_uids.update(d2[0].split())
+            except Exception:
+                pass
+
+        # Priority senders always included; general pool capped at 50 most recent
+        general_uids = list(all_today_uids - priority_uids)
+        uids = list(priority_uids) + general_uids[-50:]
+        print(f"🔍 {len(uids)} email(s) to check ({len(priority_uids)} priority, {len(general_uids)} general)")
 
         # Hard cap: look at most recent 50, process at most 20 that pass the filter
         candidates = []
-        for uid in uids[-50:]:
+        for uid in uids:
             uid_str = uid.decode()
             if uid_str in email_processed:
                 continue
