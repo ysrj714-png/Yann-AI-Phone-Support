@@ -57,6 +57,7 @@ email_sessions:    dict = {}  # email → [messages]
 email_last_active: dict = {}  # email → datetime
 email_processed:   set  = set()  # IMAP UIDs already handled this session
 pending_email:     dict = {}  # call_sid → {"caller": "+1..."}
+sentreplyids:      dict = {}  # message_id → recipient_email
 
 
 # ─── Health check ─────────────────────────────────────────────────────────────
@@ -478,130 +479,91 @@ async def email_inbox_poller():
 
 def _check_inbox():
     """
-    Reliable inbox poller:
-    - Searches UNSEEN emails from TODAY only (avoids 31k backlog)
-    - Fetches only lightweight ENVELOPE+BODY.PEEK[HEADER] first to filter fast
-    - An email passes if it has In-Reply-To OR comes from a known session sender
-    - Only fetches full RFC822 body for emails that pass the filter
-    - Hard cap of 20 per cycle
+    Simple and reliable:
+    Search ONLY for replies to emails the bot actually sent.
+    No inbox scanning. No UNSEEN flags. No date filters.
     """
+    if not sentreplyids:
+        return  # Nothing sent yet, nothing to look for
+
     try:
         mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
         mail.login(SMTP_USER, SMTP_PASS)
         mail.select("INBOX")
 
-        # Search today's unseen emails — avoids the 31k backlog
-        today = datetime.now().strftime("%d-%b-%Y")
-        _, data = mail.uid("search", None, f"UNSEEN SINCE {today}")
-        all_today_uids = set(data[0].split()) if data[0] else set()
+        found_any = False
+        for sent_mid, recipient in list(sentreplyids.items()):
+            # Search specifically for emails replying to this Message-ID
+            search_id = sent_mid.strip("<>")
+            _, data = mail.uid("search", None, f'HEADER "In-Reply-To" "{sent_mid}"')
+            uids = data[0].split() if data[0] else []
 
-        # ALSO search specifically for unseen emails FROM known session senders
-        # so active conversations are NEVER missed even if inbox gets flooded
-        priority_uids = set()
-        for known_sender in list(email_sessions.keys()):
-            try:
-                _, d2 = mail.uid("search", None,
-                    f'UNSEEN FROM "{known_sender}"')
-                if d2[0]:
-                    priority_uids.update(d2[0].split())
-            except Exception:
-                pass
+            # Also try without angle brackets (some clients strip them)
+            if not uids:
+                _, data2 = mail.uid("search", None, f'HEADER "In-Reply-To" "{search_id}"')
+                uids = data2[0].split() if data2[0] else []
 
-        # Priority senders always included; general pool capped at 50 most recent
-        general_uids = list(all_today_uids - priority_uids)
-        uids = list(priority_uids) + general_uids[-50:]
-        print(f"🔍 {len(uids)} email(s) to check ({len(priority_uids)} priority, {len(general_uids)} general)")
+            for uid in uids:
+                uid_str = uid.decode()
+                if uid_str in email_processed:
+                    continue
 
-        # Hard cap: look at most recent 50, process at most 20 that pass the filter
-        candidates = []
-        for uid in uids:
-            uid_str = uid.decode()
-            if uid_str in email_processed:
-                continue
+                found_any = True
+                _, raw_data = mail.uid("fetch", uid, "(RFC822)")
+                if not raw_data or not raw_data[0]:
+                    continue
+                msg = email_lib.message_from_bytes(raw_data[0][1])
 
-            # Fetch just the headers (fast — no body download yet)
-            _, hdr_data = mail.uid("fetch", uid, "(BODY.PEEK[HEADER])")
-            if not hdr_data or not hdr_data[0]:
-                continue
-            hdr_msg = email_lib.message_from_bytes(hdr_data[0][1])
+                sender = _parse_addr(msg.get("From", ""))
+                if not sender or sender.lower() == SMTP_USER.lower():
+                    email_processed.add(uid_str)
+                    continue
 
-            sender = _parse_addr(hdr_msg.get("From", ""))
-            if not sender or sender.lower() == SMTP_USER.lower():
-                email_processed.add(uid_str)
-                mail.uid("store", uid, "+FLAGS", "\\Seen")
-                continue
+                if _is_automated(msg, sender):
+                    email_processed.add(uid_str)
+                    continue
 
-            if _is_automated(hdr_msg, sender):
-                email_processed.add(uid_str)
-                mail.uid("store", uid, "+FLAGS", "\\Seen")
-                continue
+                body = _extract_body(msg)
+                if not body:
+                    body = _extract_body_raw(msg)
+                if not body:
+                    email_processed.add(uid_str)
+                    continue
 
-            in_reply_to   = hdr_msg.get("In-Reply-To", "").strip()
-            is_known      = sender in email_sessions
+                subject    = _decode_header_str(msg.get("Subject", ""))
+                reply_subj = subject if subject.lower().startswith("re:") else f"Re: {subject}"
+                print(f"📨 Reply from {sender}: {body[:80].replace(chr(10), ' ')}")
 
-            # Accept if: it's a reply to something OR from a known active session
-            if in_reply_to or is_known:
-                candidates.append((uid, uid_str, sender, hdr_msg))
-            else:
-                # Not a reply and unknown sender — skip silently
-                email_processed.add(uid_str)
-                mail.uid("store", uid, "+FLAGS", "\\Seen")
+                # Build or continue conversation
+                if sender not in email_sessions:
+                    email_sessions[sender] = [{"role": "system", "content": EMAIL_SYSTEM}]
+                email_last_active[sender] = datetime.now()
+                email_sessions[sender].append({"role": "user", "content": body})
 
-        print(f"📬 {len(candidates)} email(s) passed filter")
+                ai_reply = call_openai_with_tools(email_sessions[sender], max_tokens=600)
+                if ai_reply:
+                    email_sessions[sender].append({"role": "assistant", "content": ai_reply})
+                else:
+                    ai_reply = (
+                        "I'm having a brief technical issue — please reply again!\n\n"
+                        "Best regards,\nYann's AI Support"
+                    )
 
-        for uid, uid_str, sender, hdr_msg in candidates[:20]:
-            # Now fetch the full body
-            _, raw_data = mail.uid("fetch", uid, "(RFC822)")
-            if not raw_data or not raw_data[0]:
-                continue
-            msg = email_lib.message_from_bytes(raw_data[0][1])
-
-            body = _extract_body(msg)
-            if not body:
-                body = _extract_body_raw(msg)
-            if not body:
-                print(f"⏭️  {sender} — empty body after extraction, skipping")
-                email_processed.add(uid_str)
-                mail.uid("store", uid, "+FLAGS", "\\Seen")
-                continue
-
-            subject    = _decode_header_str(msg.get("Subject", ""))
-            reply_subj = subject if subject.lower().startswith("re:") else f"Re: {subject}"
-            print(f"📨 {sender}: {body[:80].replace(chr(10), ' ')}")
-
-            # Expire old sessions
-            now = datetime.now()
-            for k in [k for k, t in list(email_last_active.items())
-                      if now - t > timedelta(minutes=60)]:
-                email_sessions.pop(k, None)
-                email_last_active.pop(k, None)
-
-            # Build or continue conversation
-            if sender not in email_sessions:
-                email_sessions[sender] = [{"role": "system", "content": EMAIL_SYSTEM}]
-            email_last_active[sender] = now
-            email_sessions[sender].append({"role": "user", "content": body})
-
-            ai_reply = call_openai_with_tools(email_sessions[sender], max_tokens=600)
-            if ai_reply:
-                email_sessions[sender].append({"role": "assistant", "content": ai_reply})
-            else:
-                ai_reply = (
-                    "I'm having a brief technical issue — please reply again!\n\n"
-                    "Best regards,\nYann's AI Support"
+                _send_reply(
+                    to_email    = sender,
+                    subject     = reply_subj,
+                    body        = ai_reply,
+                    in_reply_to = msg.get("Message-ID", ""),
+                    references  = msg.get("References", "") or msg.get("Message-ID", ""),
                 )
 
-            _send_reply(
-                to_email    = sender,
-                subject     = reply_subj,
-                body        = ai_reply,
-                in_reply_to = msg.get("Message-ID", ""),
-                references  = msg.get("References", "") or msg.get("Message-ID", ""),
-            )
+                email_processed.add(uid_str)
+                # Remove old message ID, the new reply ID was added by _send_reply
+                sentreplyids.pop(sent_mid, None)
+                print(f"✅ Replied to {sender}")
 
-            mail.uid("store", uid, "+FLAGS", "\\Seen")
-            email_processed.add(uid_str)
-            print(f"✅ Reply sent → {sender}")
+        if not found_any:
+            pass  # Silent — nothing to reply to yet
 
         mail.logout()
 
@@ -609,6 +571,8 @@ def _check_inbox():
         print(f"❌ IMAP error: {e}")
     except Exception as e:
         print(f"❌ Inbox error: {e}")
+
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -646,36 +610,42 @@ async def send_opening_email(to_email: str):
         "Best regards,\nYann's AI Support"
     )
 
+    mid = email_utils.make_msgid(
+        domain=SMTP_USER.split("@")[1] if "@" in SMTP_USER else "mail"
+    )
     msg               = MIMEMultipart()
     msg["Subject"]    = "Yann's AI Support — We're Ready to Help! 👋"
     msg["From"]       = SMTP_USER
     msg["To"]         = to_email
-    msg["Message-ID"] = email_utils.make_msgid(
-        domain=SMTP_USER.split("@")[1] if "@" in SMTP_USER else "mail"
-    )
+    msg["Message-ID"] = mid
     msg.attach(MIMEText(body, "plain"))
 
     try:
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, _smtp_send, to_email, msg.as_string())
-        print(f"✅ Opening email → {to_email}")
+        # Track this Message-ID so we can find replies to it
+        sentreplyids[mid] = to_email
+        print(f"✅ Opening email → {to_email} (tracking {mid})")
     except Exception as e:
         print(f"❌ Email error: {e}")
 
 
 def _send_reply(to_email, subject, body, in_reply_to="", references=""):
     domain  = SMTP_USER.split("@")[1] if "@" in SMTP_USER else "mail"
+    mid = email_utils.make_msgid(domain=domain)
     msg               = MIMEMultipart()
     msg["Subject"]    = subject
     msg["From"]       = SMTP_USER
     msg["To"]         = to_email
-    msg["Message-ID"] = email_utils.make_msgid(domain=domain)
+    msg["Message-ID"] = mid
     if in_reply_to:
         msg["In-Reply-To"] = in_reply_to
     if references:
         msg["References"] = references
     msg.attach(MIMEText(body, "plain"))
     _smtp_send(to_email, msg.as_string())
+    # Track this reply so we can find follow-ups to it
+    sentreplyids[mid] = to_email
 
 
 def _smtp_send(to_email: str, raw_msg: str):
