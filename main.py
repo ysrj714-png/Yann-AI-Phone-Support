@@ -158,6 +158,20 @@ async def test_all(to: str = ""):
 
 
 # ─── Startup ──────────────────────────────────────────────────────────────────
+
+
+# ─── Manual inbox trigger (for testing) ───────────────────────────────────────
+@app.get("/trigger-check")
+async def trigger_check(background_tasks: BackgroundTasks):
+    """Manually fire an inbox scan right now. Use for testing."""
+    background_tasks.add_task(_check_inbox_async)
+    return {"status": "inbox scan triggered — check Render logs for results"}
+
+
+async def _check_inbox_async():
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, _check_inbox)
+
 @app.on_event("startup")
 async def startup_event():
     if SMTP_USER and SMTP_PASS:
@@ -464,82 +478,89 @@ async def email_inbox_poller():
 
 def _check_inbox():
     """
-    Smart inbox poller:
-    - Searches only the LAST 2 HOURS to avoid drowning in 31k+ old unread emails
-    - Uses IMAP HEADER search to pre-filter only emails that have In-Reply-To
-      (so we never fetch the full body of newsletters/promos)
-    - Falls back to known-sender check for email clients that strip In-Reply-To
-    - Hard cap of 20 emails per poll cycle to keep each run fast
+    Reliable inbox poller:
+    - Searches UNSEEN emails from TODAY only (avoids 31k backlog)
+    - Fetches only lightweight ENVELOPE+BODY.PEEK[HEADER] first to filter fast
+    - An email passes if it has In-Reply-To OR comes from a known session sender
+    - Only fetches full RFC822 body for emails that pass the filter
+    - Hard cap of 20 per cycle
     """
     try:
         mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
         mail.login(SMTP_USER, SMTP_PASS)
         mail.select("INBOX")
 
-        # Only look at emails from the last 2 hours — avoids the 31k backlog
-        since = (datetime.now() - timedelta(hours=2)).strftime("%d-%b-%Y")
+        # Search only today — reliable, simple, avoids the 31k backlog
+        today = datetime.now().strftime("%d-%b-%Y")
+        _, data = mail.uid("search", None, f"UNSEEN SINCE {today}")
+        uids = data[0].split() if data[0] else []
+        print(f"🔍 {len(uids)} unseen email(s) today")
 
-        # Strategy 1: find unseen replies (have In-Reply-To header) in last 2 hrs
-        _, data = mail.uid("search", None, f'UNSEEN SINCE {since} HEADER "In-Reply-To" ""')
-        reply_uids = set(data[0].split()) if data[0] else set()
-
-        # Strategy 2: find unseen emails FROM known session senders in last 2 hrs
-        # (catches email clients that strip In-Reply-To)
-        known_uids = set()
-        for known_sender in list(email_sessions.keys()):
-            try:
-                _, d2 = mail.uid("search", None,
-                    f'UNSEEN SINCE {since} FROM "{known_sender}"')
-                if d2[0]:
-                    known_uids.update(d2[0].split())
-            except Exception:
-                pass
-
-        all_uids = list(reply_uids | known_uids)
-        if all_uids:
-            print(f"🔍 {len(all_uids)} candidate email(s) to process")
-
-        # Hard cap: process at most 20 per cycle
-        for uid in all_uids[:20]:
-            uid_str = uid.decode() if isinstance(uid, bytes) else uid
+        # Hard cap: look at most recent 50, process at most 20 that pass the filter
+        candidates = []
+        for uid in uids[-50:]:
+            uid_str = uid.decode()
             if uid_str in email_processed:
                 continue
 
-            _, raw_data = mail.uid("fetch", uid, "(RFC822)")
-            if not raw_data or not raw_data[0]:
+            # Fetch just the headers (fast — no body download yet)
+            _, hdr_data = mail.uid("fetch", uid, "(BODY.PEEK[HEADER])")
+            if not hdr_data or not hdr_data[0]:
                 continue
-            msg = email_lib.message_from_bytes(raw_data[0][1])
+            hdr_msg = email_lib.message_from_bytes(hdr_data[0][1])
 
-            sender = _parse_addr(msg.get("From", ""))
+            sender = _parse_addr(hdr_msg.get("From", ""))
             if not sender or sender.lower() == SMTP_USER.lower():
                 email_processed.add(uid_str)
                 mail.uid("store", uid, "+FLAGS", "\\Seen")
                 continue
 
-            if _is_automated(msg, sender):
-                print(f"⏭️  {sender} — automated/bulk, skipping")
+            if _is_automated(hdr_msg, sender):
                 email_processed.add(uid_str)
                 mail.uid("store", uid, "+FLAGS", "\\Seen")
                 continue
+
+            in_reply_to   = hdr_msg.get("In-Reply-To", "").strip()
+            is_known      = sender in email_sessions
+
+            # Accept if: it's a reply to something OR from a known active session
+            if in_reply_to or is_known:
+                candidates.append((uid, uid_str, sender, hdr_msg))
+            else:
+                # Not a reply and unknown sender — skip silently
+                email_processed.add(uid_str)
+                mail.uid("store", uid, "+FLAGS", "\\Seen")
+
+        print(f"📬 {len(candidates)} email(s) passed filter")
+
+        for uid, uid_str, sender, hdr_msg in candidates[:20]:
+            # Now fetch the full body
+            _, raw_data = mail.uid("fetch", uid, "(RFC822)")
+            if not raw_data or not raw_data[0]:
+                continue
+            msg = email_lib.message_from_bytes(raw_data[0][1])
 
             body = _extract_body(msg)
             if not body:
                 body = _extract_body_raw(msg)
             if not body:
+                print(f"⏭️  {sender} — empty body after extraction, skipping")
                 email_processed.add(uid_str)
                 mail.uid("store", uid, "+FLAGS", "\\Seen")
                 continue
 
             subject    = _decode_header_str(msg.get("Subject", ""))
             reply_subj = subject if subject.lower().startswith("re:") else f"Re: {subject}"
-            print(f"📨 Reply from {sender}: {body[:80].replace(chr(10),' ')}")
+            print(f"📨 {sender}: {body[:80].replace(chr(10), ' ')}")
 
+            # Expire old sessions
             now = datetime.now()
             for k in [k for k, t in list(email_last_active.items())
                       if now - t > timedelta(minutes=60)]:
                 email_sessions.pop(k, None)
                 email_last_active.pop(k, None)
 
+            # Build or continue conversation
             if sender not in email_sessions:
                 email_sessions[sender] = [{"role": "system", "content": EMAIL_SYSTEM}]
             email_last_active[sender] = now
