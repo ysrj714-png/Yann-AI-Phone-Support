@@ -197,10 +197,11 @@ async def _check_inbox_async():
 
 # ─── Send opening email without calling (for testing) ─────────────────────────
 @app.get("/send-opening")
-async def send_opening(to: str = "", background_tasks: BackgroundTasks = None):
+async def send_opening(to: str = ""):
     if not to:
         return {"error": "Add ?to=your@email.com to the URL"}
-    background_tasks.add_task(send_opening_email, to)
+    # Run directly — no BackgroundTasks needed for a GET endpoint
+    asyncio.create_task(send_opening_email(to))
     return {"status": f"Opening email sending to {to} — check your inbox in a few seconds"}
 
 @app.on_event("startup")
@@ -735,8 +736,6 @@ def call_openai_with_tools(messages: list, max_tokens: int = 300) -> str | None:
             json={
                 "model":       "gpt-4o-search-preview",
                 "messages":    messages,
-                "tools":       AI_TOOLS,
-                "tool_choice": "auto",
                 "max_tokens":  max_tokens,
             },
             timeout=25,
