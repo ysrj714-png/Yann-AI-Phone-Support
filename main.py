@@ -463,19 +463,45 @@ async def email_inbox_poller():
 
 
 def _check_inbox():
+    """
+    Smart inbox poller:
+    - Searches only the LAST 2 HOURS to avoid drowning in 31k+ old unread emails
+    - Uses IMAP HEADER search to pre-filter only emails that have In-Reply-To
+      (so we never fetch the full body of newsletters/promos)
+    - Falls back to known-sender check for email clients that strip In-Reply-To
+    - Hard cap of 20 emails per poll cycle to keep each run fast
+    """
     try:
         mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
         mail.login(SMTP_USER, SMTP_PASS)
         mail.select("INBOX")
 
-        since = (datetime.now() - timedelta(days=7)).strftime("%d-%b-%Y")
-        _, data = mail.uid("search", None, f"UNSEEN SINCE {since}")
-        uids = data[0].split() if data[0] else []
-        if uids:
-            print(f"🔍 {len(uids)} recent unseen email(s)")
+        # Only look at emails from the last 2 hours — avoids the 31k backlog
+        since = (datetime.now() - timedelta(hours=2)).strftime("%d-%b-%Y")
 
-        for uid in uids:
-            uid_str = uid.decode()
+        # Strategy 1: find unseen replies (have In-Reply-To header) in last 2 hrs
+        _, data = mail.uid("search", None, f'UNSEEN SINCE {since} HEADER "In-Reply-To" ""')
+        reply_uids = set(data[0].split()) if data[0] else set()
+
+        # Strategy 2: find unseen emails FROM known session senders in last 2 hrs
+        # (catches email clients that strip In-Reply-To)
+        known_uids = set()
+        for known_sender in list(email_sessions.keys()):
+            try:
+                _, d2 = mail.uid("search", None,
+                    f'UNSEEN SINCE {since} FROM "{known_sender}"')
+                if d2[0]:
+                    known_uids.update(d2[0].split())
+            except Exception:
+                pass
+
+        all_uids = list(reply_uids | known_uids)
+        if all_uids:
+            print(f"🔍 {len(all_uids)} candidate email(s) to process")
+
+        # Hard cap: process at most 20 per cycle
+        for uid in all_uids[:20]:
+            uid_str = uid.decode() if isinstance(uid, bytes) else uid
             if uid_str in email_processed:
                 continue
 
@@ -496,19 +522,7 @@ def _check_inbox():
                 mail.uid("store", uid, "+FLAGS", "\\Seen")
                 continue
 
-            # FIX: Accept both direct replies (In-Reply-To) AND fresh emails
-            # from known session senders (so follow-up chains work even if
-            # the email client drops the In-Reply-To header).
-            in_reply_to = msg.get("In-Reply-To", "").strip()
-            is_known_sender = sender in email_sessions
-            if not in_reply_to and not is_known_sender:
-                print(f"⏭️  {sender} — no In-Reply-To and unknown sender, skipping")
-                email_processed.add(uid_str)
-                mail.uid("store", uid, "+FLAGS", "\\Seen")
-                continue
-
             body = _extract_body(msg)
-            # FIX: If body is empty after stripping quotes, try extracting raw
             if not body:
                 body = _extract_body_raw(msg)
             if not body:
@@ -531,7 +545,6 @@ def _check_inbox():
             email_last_active[sender] = now
             email_sessions[sender].append({"role": "user", "content": body})
 
-            # FIX: use tool-calling AI so it can answer weather/location in email too
             ai_reply = call_openai_with_tools(email_sessions[sender], max_tokens=600)
             if ai_reply:
                 email_sessions[sender].append({"role": "assistant", "content": ai_reply})
