@@ -2,6 +2,7 @@ import asyncio
 import email as email_lib
 import email.utils as email_utils
 import imaplib
+import json
 import os
 import re
 import requests
@@ -32,6 +33,8 @@ SMTP_PASS           = os.environ.get("SMTP_PASS", "")
 IMAP_HOST           = os.environ.get("IMAP_HOST", "imap.gmail.com")
 IMAP_PORT           = int(os.environ.get("IMAP_PORT", 993))
 EMAIL_POLL_INTERVAL = int(os.environ.get("EMAIL_POLL_INTERVAL", 30))
+# Get a free key at https://openweathermap.org/api
+WEATHER_API_KEY     = os.environ.get("WEATHER_API_KEY", "")
 
 VOICE = "Polly.Joanna"
 
@@ -65,39 +68,29 @@ async def index():
         "openai":  f"set ({OPENAI_API_KEY[:8]}...)" if OPENAI_API_KEY else "MISSING ❌",
         "twilio":  "set" if TWILIO_SID else "MISSING ❌",
         "smtp":    "set" if SMTP_USER else "MISSING ❌",
+        "weather": "set" if WEATHER_API_KEY else "not configured (optional)",
     }
 
 
 # ─── Diagnostic test endpoint ─────────────────────────────────────────────────
-# Call GET /test?to=your@email.com to:
-#   1. Verify all env vars are set
-#   2. Test SMTP (send a real email)
-#   3. Test IMAP connection
-#   4. Test OpenAI
-# This lets you debug without a phone call.
 @app.get("/test")
 async def test_all(to: str = ""):
     results = {}
-
-    # ── Env vars ──────────────────────────────────────────────────────────────
     results["env"] = {
         "OPENAI_API_KEY": "✅ set" if OPENAI_API_KEY else "❌ MISSING",
         "TWILIO_SID":     "✅ set" if TWILIO_SID     else "❌ MISSING",
         "SMTP_USER":      SMTP_USER if SMTP_USER      else "❌ MISSING",
         "SMTP_PASS":      "✅ set"  if SMTP_PASS      else "❌ MISSING",
         "IMAP_HOST":      IMAP_HOST,
+        "WEATHER_API_KEY": "✅ set" if WEATHER_API_KEY else "not set (optional)",
     }
 
-    # ── SMTP test ─────────────────────────────────────────────────────────────
     if SMTP_USER and SMTP_PASS and to:
         try:
-            import smtplib
             with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
                 s.starttls()
                 s.login(SMTP_USER, SMTP_PASS)
             results["smtp"] = "✅ login OK"
-
-            # Send a real test email
             msg               = MIMEMultipart()
             msg["Subject"]    = "Yann's AI Support — Test Email"
             msg["From"]       = SMTP_USER
@@ -122,10 +115,8 @@ async def test_all(to: str = ""):
     else:
         results["smtp"] = "❌ SMTP_USER or SMTP_PASS not set"
 
-    # ── IMAP test ─────────────────────────────────────────────────────────────
     if SMTP_USER and SMTP_PASS:
         try:
-            import imaplib
             mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
             mail.login(SMTP_USER, SMTP_PASS)
             mail.select("INBOX")
@@ -138,7 +129,6 @@ async def test_all(to: str = ""):
     else:
         results["imap"] = "❌ SMTP_USER or SMTP_PASS not set"
 
-    # ── OpenAI test ───────────────────────────────────────────────────────────
     if OPENAI_API_KEY:
         try:
             resp = requests.post(
@@ -197,7 +187,7 @@ async def incoming_call(request: Request):
         action=f"/choose-channel?call_sid={safe_sid}&caller={safe_caller}",
         method="POST",
         speech_timeout="auto",
-        timeout=6,
+        timeout=8,
         language="en-US",
     )
     gather.say(
@@ -226,25 +216,28 @@ async def choose_channel(request: Request, background_tasks: BackgroundTasks):
 
     resp = VoiceResponse()
 
-    # ── TEXT ──────────────────────────────────────────────────────────────────
     if any(w in speech for w in ["text", "sms", "message", "txt"]):
         resp.say("Ok! You'll get a text shortly. Goodbye!", voice=VOICE)
         resp.hangup()
         background_tasks.add_task(send_opening_sms, caller)
         return HTMLResponse(content=str(resp), media_type="application/xml")
 
-    # ── EMAIL ─────────────────────────────────────────────────────────────────
     if any(w in speech for w in ["email", "e-mail", "mail"]):
         pending_email[call_sid] = {"caller": caller}
         gather = Gather(
             input="speech",
+            # FIX: enhanced model + longer timeout for email capture
             action=f"/collect-email?call_sid={safe_sid}&caller={safe_caller}",
             method="POST",
-            speech_timeout="auto",
-            timeout=10,
+            speech_timeout=5,          # wait 5s of silence before cutting off
+            timeout=15,                # give 15s total to start speaking
             language="en-US",
         )
-        gather.say("What is your email address?", voice=VOICE)
+        gather.say(
+            "Please say your email address slowly and clearly. "
+            "For example: john at gmail dot com.",
+            voice=VOICE,
+        )
         resp.append(gather)
         resp.redirect(
             f"/collect-email?call_sid={safe_sid}&caller={safe_caller}&timeout=1",
@@ -252,13 +245,12 @@ async def choose_channel(request: Request, background_tasks: BackgroundTasks):
         )
         return HTMLResponse(content=str(resp), media_type="application/xml")
 
-    # ── Didn't understand ─────────────────────────────────────────────────────
     gather = Gather(
         input="speech",
         action=f"/choose-channel?call_sid={safe_sid}&caller={safe_caller}",
         method="POST",
         speech_timeout="auto",
-        timeout=6,
+        timeout=8,
     )
     gather.say("Sorry, I didn't catch that. Please say email or text.", voice=VOICE)
     resp.append(gather)
@@ -266,7 +258,7 @@ async def choose_channel(request: Request, background_tasks: BackgroundTasks):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PHONE — Step 3: collect email address
+# PHONE — Step 3: collect email address with confirmation
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.api_route("/collect-email", methods=["GET", "POST"])
@@ -287,12 +279,14 @@ async def collect_email(request: Request, background_tasks: BackgroundTasks):
             input="speech",
             action=f"/collect-email?call_sid={safe_sid}&caller={safe_caller}",
             method="POST",
-            speech_timeout="auto",
-            timeout=10,
+            speech_timeout=5,
+            timeout=15,
+            language="en-US",
         )
         gather.say(
             "I didn't hear anything. "
-            "Please say your email address, for example: john at gmail dot com.",
+            "Please say your email address slowly. "
+            "For example: john at gmail dot com.",
             voice=VOICE,
         )
         resp.append(gather)
@@ -305,27 +299,114 @@ async def collect_email(request: Request, background_tasks: BackgroundTasks):
     email_addr = extract_email(speech)
 
     if email_addr:
-        print(f"✅ Email captured: {email_addr}")
-        resp.say("Got it! Sending you an email now. Goodbye!", voice=VOICE)
-        resp.hangup()
-        background_tasks.add_task(send_opening_email, email_addr)
-        pending_email.pop(call_sid, None)
+        # FIX: Read back email letter-by-letter to confirm before sending
+        spelled = spell_out_email(email_addr)
+        safe_email = quote(email_addr, safe="")
+        gather = Gather(
+            input="speech",
+            action=f"/confirm-email?call_sid={safe_sid}&caller={safe_caller}&email={safe_email}",
+            method="POST",
+            speech_timeout="auto",
+            timeout=8,
+            language="en-US",
+        )
+        gather.say(
+            f"I heard {spelled}. "
+            "Is that correct? Say yes to confirm or no to try again.",
+            voice=VOICE,
+        )
+        resp.append(gather)
+        # If no response, treat as confirmed
+        resp.redirect(
+            f"/confirm-email?call_sid={safe_sid}&caller={safe_caller}&email={safe_email}&confirmed=1",
+            method="POST",
+        )
     else:
         gather = Gather(
             input="speech",
             action=f"/collect-email?call_sid={safe_sid}&caller={safe_caller}",
             method="POST",
-            speech_timeout="auto",
-            timeout=10,
+            speech_timeout=5,
+            timeout=15,
+            language="en-US",
         )
         gather.say(
             "Sorry, I didn't catch that. "
-            "Please say your email slowly, for example: john at gmail dot com.",
+            "Please say your email slowly. "
+            "Spell it out if needed, for example: j o h n at g mail dot com.",
             voice=VOICE,
         )
         resp.append(gather)
         resp.redirect(
             f"/collect-email?call_sid={safe_sid}&caller={safe_caller}&timeout=1",
+            method="POST",
+        )
+
+    return HTMLResponse(content=str(resp), media_type="application/xml")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PHONE — Step 4: confirm email address
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.api_route("/confirm-email", methods=["GET", "POST"])
+async def confirm_email(request: Request, background_tasks: BackgroundTasks):
+    form        = await request.form()
+    speech      = form.get("SpeechResult", "").strip().lower()
+    call_sid    = unquote(request.query_params.get("call_sid",  "unknown"))
+    caller      = unquote(request.query_params.get("caller",    "Unknown"))
+    email_addr  = unquote(request.query_params.get("email",     ""))
+    confirmed   = request.query_params.get("confirmed", "0") == "1"
+    safe_sid    = quote(call_sid,   safe="")
+    safe_caller = quote(caller,     safe="")
+
+    resp = VoiceResponse()
+
+    # "yes" or timeout fallback (confirmed=1) → send the email
+    if confirmed or any(w in speech for w in ["yes", "correct", "right", "yeah", "yep", "sure"]):
+        print(f"✅ Email confirmed: {email_addr}")
+        resp.say("Got it! Sending you an email now. Goodbye!", voice=VOICE)
+        resp.hangup()
+        background_tasks.add_task(send_opening_email, email_addr)
+        pending_email.pop(call_sid, None)
+    elif any(w in speech for w in ["no", "nope", "wrong", "incorrect"]):
+        # Go back to collect-email
+        safe_email = quote(email_addr, safe="")
+        gather = Gather(
+            input="speech",
+            action=f"/collect-email?call_sid={safe_sid}&caller={safe_caller}",
+            method="POST",
+            speech_timeout=5,
+            timeout=15,
+            language="en-US",
+        )
+        gather.say(
+            "No problem. Please say your email address again slowly.",
+            voice=VOICE,
+        )
+        resp.append(gather)
+        resp.redirect(
+            f"/collect-email?call_sid={safe_sid}&caller={safe_caller}&timeout=1",
+            method="POST",
+        )
+    else:
+        # Didn't understand — ask again
+        spelled = spell_out_email(email_addr)
+        safe_email = quote(email_addr, safe="")
+        gather = Gather(
+            input="speech",
+            action=f"/confirm-email?call_sid={safe_sid}&caller={safe_caller}&email={safe_email}",
+            method="POST",
+            speech_timeout="auto",
+            timeout=8,
+        )
+        gather.say(
+            f"Sorry, say yes if {spelled} is correct, or no to try again.",
+            voice=VOICE,
+        )
+        resp.append(gather)
+        resp.redirect(
+            f"/confirm-email?call_sid={safe_sid}&caller={safe_caller}&email={safe_email}&confirmed=1",
             method="POST",
         )
 
@@ -354,7 +435,8 @@ async def incoming_sms(request: Request):
     sms_last_active[phone] = now
     sms_sessions[phone].append({"role": "user", "content": body})
 
-    reply = call_openai(sms_sessions[phone], max_tokens=300)
+    # FIX: use tool-calling AI so it can answer weather and location questions
+    reply = call_openai_with_tools(sms_sessions[phone], max_tokens=300)
     if reply:
         sms_sessions[phone].append({"role": "assistant", "content": reply})
     else:
@@ -367,11 +449,6 @@ async def incoming_sms(request: Request):
 
 # ══════════════════════════════════════════════════════════════════════════════
 # EMAIL INBOX POLLER
-# Checks Gmail every EMAIL_POLL_INTERVAL seconds for new replies.
-# Replies to any email that:
-#   1. Is NOT automated/bulk (no List-Unsubscribe, Precedence: bulk, etc.)
-#   2. HAS an In-Reply-To header (meaning it's a reply to something, not
-#      a cold/fresh email like a newsletter or promotion)
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def email_inbox_poller():
@@ -391,8 +468,6 @@ def _check_inbox():
         mail.login(SMTP_USER, SMTP_PASS)
         mail.select("INBOX")
 
-        # Only look at emails from the last 7 days — avoids processing
-        # the entire backlog (you have 32k+ unseen emails which caused timeouts)
         since = (datetime.now() - timedelta(days=7)).strftime("%d-%b-%Y")
         _, data = mail.uid("search", None, f"UNSEEN SINCE {since}")
         uids = data[0].split() if data[0] else []
@@ -409,32 +484,33 @@ def _check_inbox():
                 continue
             msg = email_lib.message_from_bytes(raw_data[0][1])
 
-            # Parse sender
             sender = _parse_addr(msg.get("From", ""))
             if not sender or sender.lower() == SMTP_USER.lower():
                 email_processed.add(uid_str)
                 mail.uid("store", uid, "+FLAGS", "\\Seen")
                 continue
 
-            # Guard 1 — skip automated / bulk / marketing email
             if _is_automated(msg, sender):
                 print(f"⏭️  {sender} — automated/bulk, skipping")
                 email_processed.add(uid_str)
                 mail.uid("store", uid, "+FLAGS", "\\Seen")
                 continue
 
-            # Guard 2 — must be a reply (has In-Reply-To header)
-            # Fresh marketing emails and newsletters never have In-Reply-To.
-            # Every genuine human reply does.
+            # FIX: Accept both direct replies (In-Reply-To) AND fresh emails
+            # from known session senders (so follow-up chains work even if
+            # the email client drops the In-Reply-To header).
             in_reply_to = msg.get("In-Reply-To", "").strip()
-            if not in_reply_to:
-                print(f"⏭️  {sender} — no In-Reply-To, skipping")
+            is_known_sender = sender in email_sessions
+            if not in_reply_to and not is_known_sender:
+                print(f"⏭️  {sender} — no In-Reply-To and unknown sender, skipping")
                 email_processed.add(uid_str)
                 mail.uid("store", uid, "+FLAGS", "\\Seen")
                 continue
 
-            # Extract body
             body = _extract_body(msg)
+            # FIX: If body is empty after stripping quotes, try extracting raw
+            if not body:
+                body = _extract_body_raw(msg)
             if not body:
                 email_processed.add(uid_str)
                 mail.uid("store", uid, "+FLAGS", "\\Seen")
@@ -444,7 +520,6 @@ def _check_inbox():
             reply_subj = subject if subject.lower().startswith("re:") else f"Re: {subject}"
             print(f"📨 Reply from {sender}: {body[:80].replace(chr(10),' ')}")
 
-            # Build/continue conversation
             now = datetime.now()
             for k in [k for k, t in list(email_last_active.items())
                       if now - t > timedelta(minutes=60)]:
@@ -456,7 +531,8 @@ def _check_inbox():
             email_last_active[sender] = now
             email_sessions[sender].append({"role": "user", "content": body})
 
-            ai_reply = call_openai(email_sessions[sender], max_tokens=600)
+            # FIX: use tool-calling AI so it can answer weather/location in email too
+            ai_reply = call_openai_with_tools(email_sessions[sender], max_tokens=600)
             if ai_reply:
                 email_sessions[sender].append({"role": "assistant", "content": ai_reply})
             else:
@@ -560,6 +636,180 @@ def _smtp_send(to_email: str, raw_msg: str):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# WEATHER & LOCATION TOOLS (for OpenAI function calling)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Tool definitions passed to OpenAI
+AI_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get current weather for a city or location. Use when the user asks about weather.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string",
+                        "description": "City name or city,country code, e.g. 'London' or 'Miami,US'",
+                    }
+                },
+                "required": ["location"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_location_from_ip",
+            "description": "Estimate the caller's approximate location based on IP. Use when user asks where they are.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+]
+
+
+def get_weather(location: str) -> str:
+    """Call OpenWeatherMap to get current weather."""
+    if not WEATHER_API_KEY:
+        return "Weather lookup is not configured. Please ask the admin to add a WEATHER_API_KEY."
+    try:
+        resp = requests.get(
+            "https://api.openweathermap.org/data/2.5/weather",
+            params={
+                "q":     location,
+                "appid": WEATHER_API_KEY,
+                "units": "imperial",  # change to "metric" for Celsius
+            },
+            timeout=10,
+        )
+        if resp.status_code == 404:
+            return f"I couldn't find weather data for '{location}'. Try a different city name."
+        resp.raise_for_status()
+        data = resp.json()
+        city    = data["name"]
+        country = data["sys"]["country"]
+        temp    = data["main"]["temp"]
+        feels   = data["main"]["feels_like"]
+        desc    = data["weather"][0]["description"].capitalize()
+        humidity= data["main"]["humidity"]
+        return (
+            f"Weather in {city}, {country}: {desc}. "
+            f"Temperature: {temp:.0f}°F (feels like {feels:.0f}°F). "
+            f"Humidity: {humidity}%."
+        )
+    except Exception as e:
+        return f"Sorry, I had trouble fetching the weather: {e}"
+
+
+def get_location_from_ip() -> str:
+    """Use ip-api.com (free, no key needed) to get approximate location."""
+    try:
+        resp = requests.get("http://ip-api.com/json/", timeout=8)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("status") == "success":
+            city    = data.get("city", "unknown city")
+            region  = data.get("regionName", "")
+            country = data.get("country", "")
+            return (
+                f"Based on the server's IP address, the approximate location is "
+                f"{city}, {region}, {country}. "
+                f"Note: this reflects the server location, not your personal location."
+            )
+        return "I wasn't able to determine a location from the IP address."
+    except Exception as e:
+        return f"Sorry, I had trouble getting location info: {e}"
+
+
+def call_openai_with_tools(messages: list, max_tokens: int = 300) -> str | None:
+    """
+    Call OpenAI with tool support. If the model wants to call a tool
+    (weather / location), execute it and send the result back.
+    """
+    try:
+        resp = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type":  "application/json",
+            },
+            json={
+                "model":       "gpt-4o",
+                "messages":    messages,
+                "tools":       AI_TOOLS,
+                "tool_choice": "auto",
+                "max_tokens":  max_tokens,
+                "temperature": 0.75,
+            },
+            timeout=25,
+        )
+        resp.raise_for_status()
+        choice = resp.json()["choices"][0]
+
+        # No tool call — return the text directly
+        if choice["finish_reason"] != "tool_calls":
+            return choice["message"]["content"].strip()
+
+        # Tool call requested
+        tool_calls = choice["message"]["tool_calls"]
+        # Append assistant's tool-call message to conversation
+        messages_with_tools = messages + [choice["message"]]
+
+        for tc in tool_calls:
+            fn_name = tc["function"]["name"]
+            fn_args = json.loads(tc["function"]["arguments"])
+            print(f"🔧 Tool call: {fn_name}({fn_args})")
+
+            if fn_name == "get_weather":
+                tool_result = get_weather(fn_args.get("location", ""))
+            elif fn_name == "get_location_from_ip":
+                tool_result = get_location_from_ip()
+            else:
+                tool_result = "Unknown tool."
+
+            messages_with_tools.append({
+                "role":         "tool",
+                "tool_call_id": tc["id"],
+                "content":      tool_result,
+            })
+
+        # Second call with tool results
+        resp2 = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type":  "application/json",
+            },
+            json={
+                "model":       "gpt-4o",
+                "messages":    messages_with_tools,
+                "max_tokens":  max_tokens,
+                "temperature": 0.75,
+            },
+            timeout=25,
+        )
+        resp2.raise_for_status()
+        return resp2.json()["choices"][0]["message"]["content"].strip()
+
+    except requests.exceptions.HTTPError as e:
+        print(f"❌ OpenAI HTTP error: {e}")
+        return None
+    except Exception as e:
+        print(f"❌ OpenAI error: {e}")
+        return None
+
+
+# Keep simple call_openai for backward compat
+def call_openai(messages: list, max_tokens: int = 300) -> str | None:
+    return call_openai_with_tools(messages, max_tokens)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -595,6 +845,7 @@ def _decode_header_str(value: str) -> str:
 
 
 def _extract_body(msg) -> str:
+    """Extract body, stripping quoted lines."""
     text = ""
     if msg.is_multipart():
         for part in msg.walk():
@@ -623,30 +874,38 @@ def _extract_body(msg) -> str:
     return "\n".join(clean).strip()
 
 
-def call_openai(messages: list, max_tokens: int = 300) -> str | None:
-    try:
-        resp = requests.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {OPENAI_API_KEY}",
-                "Content-Type":  "application/json",
-            },
-            json={
-                "model":       "gpt-4o",
-                "messages":    messages,
-                "max_tokens":  max_tokens,
-                "temperature": 0.75,
-            },
-            timeout=20,
-        )
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"].strip()
-    except requests.exceptions.HTTPError as e:
-        print(f"❌ OpenAI HTTP error {resp.status_code}: {resp.text[:200]}")
-        return None
-    except Exception as e:
-        print(f"❌ OpenAI error: {e}")
-        return None
+def _extract_body_raw(msg) -> str:
+    """Fallback: extract body WITHOUT stripping quotes (for when body was all-quoted)."""
+    text = ""
+    if msg.is_multipart():
+        for part in msg.walk():
+            if (part.get_content_type() == "text/plain"
+                    and part.get("Content-Disposition") != "attachment"):
+                payload = part.get_payload(decode=True)
+                if payload:
+                    text = payload.decode(
+                        part.get_content_charset() or "utf-8", errors="replace"
+                    )
+                    break
+    else:
+        payload = msg.get_payload(decode=True)
+        if payload:
+            text = payload.decode(
+                msg.get_content_charset() or "utf-8", errors="replace"
+            )
+    return text.strip()
+
+
+def spell_out_email(email_addr: str) -> str:
+    """Convert email to spoken form: 'j o h n at gmail dot com'"""
+    if "@" not in email_addr:
+        return email_addr
+    local, domain = email_addr.split("@", 1)
+    # spell out local part letter by letter
+    local_spoken = " ".join(local)
+    # make domain readable
+    domain_spoken = domain.replace(".", " dot ")
+    return f"{local_spoken}, at, {domain_spoken}"
 
 
 def extract_email(text: str) -> str | None:
@@ -659,7 +918,7 @@ def extract_email(text: str) -> str | None:
         t = re.sub(rf"\b{word}\b", digit, t)
     t = re.sub(r"\s+at\s+",  "@", t)
     t = re.sub(r"\s+dot\s+", ".", t)
-    t = re.sub(r"\s+",       "",  t)
+    t = re.sub(r"\s+",        "",  t)
     m = re.search(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", t)
     return m.group(0) if m else None
 
