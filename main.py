@@ -38,17 +38,38 @@ WEATHER_API_KEY     = os.environ.get("WEATHER_API_KEY", "")
 
 VOICE = "Polly.Joanna"
 
-SMS_SYSTEM = """You are a friendly and knowledgeable AI assistant for Yann's AI Support.
-Help anyone who messages you with advice or support on ANY topic — personal, business, technical, emotional, anything.
-Be warm, genuine, and helpful. Keep replies conversational.
+SMS_SYSTEM = """You are a highly knowledgeable AI assistant for Yann's AI Support.
+Help anyone who messages you with accurate, helpful answers on ANY topic — personal, business, technical, creative, emotional, anything.
+Be warm, genuine, and conversational. Give real answers, not vague responses.
+Keep replies concise for SMS but don't sacrifice accuracy for brevity.
 Sign every reply with: — Yann's AI Support"""
 
-EMAIL_SYSTEM = """You are a friendly and knowledgeable AI assistant for Yann's AI Support.
-Help anyone who emails you with advice or support on ANY topic — personal, business, technical, emotional, anything.
-Write in a clear, warm, professional tone. Use short paragraphs.
+def _build_email_system():
+    today = datetime.now().strftime("%B %d, %Y")
+    return f"""You are a highly knowledgeable AI assistant for Yann's AI Support.
+Today's date is {today}. Always use this as your reference for current events and time-sensitive questions.
+Help anyone who emails you with thorough, detailed, accurate answers on ANY topic — personal, business, technical, creative, emotional, anything.
+Give complete answers like ChatGPT would. Don't cut yourself short. If a question deserves a detailed explanation, give one.
+Use clear formatting: bullet points, numbered steps, or sections where helpful.
+Be warm, genuine, and conversational — not robotic.
+For current events or real-time info, use the web_search tool to look it up before answering.
+If you don't know something, say so honestly.
 Sign every reply with:
 Best regards,
 Yann's AI Support"""
+
+def _build_sms_system():
+    today = datetime.now().strftime("%B %d, %Y")
+    return f"""You are a highly knowledgeable AI assistant for Yann's AI Support.
+Today's date is {today}. Always use this as your reference for current events and time-sensitive questions.
+Help anyone who messages you with accurate, helpful answers on ANY topic — personal, business, technical, creative, emotional, anything.
+Be warm, genuine, and conversational. Give real answers, not vague responses.
+For current events or real-time info, use the web_search tool to look it up before answering.
+Keep replies concise for SMS but don't sacrifice accuracy for brevity.
+Sign every reply with: — Yann's AI Support"""
+
+EMAIL_SYSTEM = _build_email_system()
+SMS_SYSTEM   = _build_sms_system()
 
 # ─── Session memory ───────────────────────────────────────────────────────────
 sms_sessions:      dict = {}  # phone → [messages]
@@ -172,6 +193,15 @@ async def trigger_check(background_tasks: BackgroundTasks):
 async def _check_inbox_async():
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, _check_inbox)
+
+
+# ─── Send opening email without calling (for testing) ─────────────────────────
+@app.get("/send-opening")
+async def send_opening(to: str = "", background_tasks: BackgroundTasks = None):
+    if not to:
+        return {"error": "Add ?to=your@email.com to the URL"}
+    background_tasks.add_task(send_opening_email, to)
+    return {"status": f"Opening email sending to {to} — check your inbox in a few seconds"}
 
 @app.on_event("startup")
 async def startup_event():
@@ -446,7 +476,7 @@ async def incoming_sms(request: Request):
         sms_last_active.pop(k, None)
 
     if phone not in sms_sessions:
-        sms_sessions[phone] = [{"role": "system", "content": SMS_SYSTEM}]
+        sms_sessions[phone] = [{"role": "system", "content": _build_sms_system()}]
     sms_last_active[phone] = now
     sms_sessions[phone].append({"role": "user", "content": body})
 
@@ -540,7 +570,7 @@ def _check_inbox():
                 email_last_active[sender] = datetime.now()
                 email_sessions[sender].append({"role": "user", "content": body})
 
-                ai_reply = call_openai_with_tools(email_sessions[sender], max_tokens=600)
+                ai_reply = call_openai_with_tools(email_sessions[sender], max_tokens=1500)
                 if ai_reply:
                     email_sessions[sender].append({"role": "assistant", "content": ai_reply})
                 else:
@@ -659,8 +689,75 @@ def _smtp_send(to_email: str, raw_msg: str):
 # WEATHER & LOCATION TOOLS (for OpenAI function calling)
 # ══════════════════════════════════════════════════════════════════════════════
 
+def web_search(query: str) -> str:
+    """Search the web using DuckDuckGo — free, no API key needed."""
+    try:
+        # DuckDuckGo Instant Answer API
+        resp = requests.get(
+            "https://api.duckduckgo.com/",
+            params={"q": query, "format": "json", "no_html": "1", "skip_disambig": "1"},
+            timeout=10,
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        results = []
+
+        # Abstract (best single answer)
+        if data.get("AbstractText"):
+            results.append(data["AbstractText"])
+
+        # Answer (e.g. "Barack Obama" for "who is president")
+        if data.get("Answer"):
+            results.append(data["Answer"])
+
+        # Related topics
+        for topic in data.get("RelatedTopics", [])[:3]:
+            if isinstance(topic, dict) and topic.get("Text"):
+                results.append(topic["Text"])
+
+        if results:
+            return "\n".join(results)
+
+        # Fallback: DuckDuckGo HTML search for broader queries
+        resp2 = requests.get(
+            "https://html.duckduckgo.com/html/",
+            params={"q": query},
+            timeout=10,
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        # Extract first result snippets
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(resp2.text, "html.parser")
+        snippets = [r.get_text(strip=True) for r in soup.select(".result__snippet")[:3]]
+        if snippets:
+            return "\n".join(snippets)
+
+        return f"No results found for: {query}"
+    except Exception as e:
+        return f"Search failed: {e}"
+
+
 # Tool definitions passed to OpenAI
 AI_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Search the web for current, real-time information. Use for: current events, who is president, today's news, recent sports scores, stock prices, weather, or anything that may have changed recently.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The search query, e.g. 'who is the president of the United States 2025'",
+                    }
+                },
+                "required": ["query"],
+            },
+        },
+    },
     {
         "type": "function",
         "function": {
@@ -785,7 +882,9 @@ def call_openai_with_tools(messages: list, max_tokens: int = 300) -> str | None:
             fn_args = json.loads(tc["function"]["arguments"])
             print(f"🔧 Tool call: {fn_name}({fn_args})")
 
-            if fn_name == "get_weather":
+            if fn_name == "web_search":
+                tool_result = web_search(fn_args.get("query", ""))
+            elif fn_name == "get_weather":
                 tool_result = get_weather(fn_args.get("location", ""))
             elif fn_name == "get_location_from_ip":
                 tool_result = get_location_from_ip()
