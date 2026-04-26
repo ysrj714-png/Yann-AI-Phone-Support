@@ -734,9 +734,10 @@ def call_openai_with_tools(messages: list, max_tokens: int = 300) -> str | None:
                 "Content-Type":  "application/json",
             },
             json={
-                "model":       "gpt-4o-search-preview",
-                "messages":    messages,
-                "max_tokens":  max_tokens,
+                "model":              "gpt-4o-search-preview",
+                "messages":           messages,
+                "max_tokens":         max_tokens,
+                "web_search_options": {},
             },
             timeout=25,
         )
