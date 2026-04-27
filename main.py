@@ -605,6 +605,56 @@ def _check_inbox():
         print(f"❌ Inbox error: {e}")
 
 
+
+async def send_opening_sms(to_number: str):
+    if not TWILIO_SID or not to_number or to_number == "Unknown":
+        return
+    body = (
+        "👋 Hey! This is Yann's AI Support.\n\n"
+        "What do you need my friend? I'm here to help with anything — "
+        "just type your question right here! 😊"
+    )
+    try:
+        TwilioClient(TWILIO_SID, TWILIO_TOKEN).messages.create(
+            body=body, from_=TWILIO_NUMBER, to=to_number
+        )
+        print(f"✅ Opening SMS → {to_number}")
+    except Exception as e:
+        print(f"❌ SMS error: {e}")
+
+
+async def send_opening_email(to_email: str):
+    if not SMTP_USER or not SMTP_PASS:
+        print("⚠️  SMTP not configured")
+        return
+
+    body = (
+        "Hey there!\n\n"
+        "This is Yann's AI Support — you just called us and chose email.\n\n"
+        "What do you need my friend? 😊\n\n"
+        "Just reply to this email with your question and I'll get back to you "
+        "right away with helpful advice on anything you need.\n\n"
+        "Best regards,\nYann's AI Support"
+    )
+
+    mid = email_utils.make_msgid(
+        domain=SMTP_USER.split("@")[1] if "@" in SMTP_USER else "mail"
+    )
+    msg               = MIMEMultipart()
+    msg["Subject"]    = "Yann's AI Support — We're Ready to Help! 👋"
+    msg["From"]       = SMTP_USER
+    msg["To"]         = to_email
+    msg["Message-ID"] = mid
+    msg.attach(MIMEText(body, "plain"))
+
+    try:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, _smtp_send, to_email, msg.as_string())
+        print(f"✅ Opening email → {to_email}")
+    except Exception as e:
+        print(f"❌ Email error: {e}")
+
+
 def _send_reply(to_email, subject, body, in_reply_to="", references=""):
     domain  = SMTP_USER.split("@")[1] if "@" in SMTP_USER else "mail"
     mid = email_utils.make_msgid(domain=domain)
